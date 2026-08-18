@@ -2,13 +2,14 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
 import type { AttachmentLimits, IncomingFile } from "../attachments.js";
-import { loadSpokeConfig } from "../config.js";
+import { hubSlug, loadSpokeConfig } from "../config.js";
 import { HerdrClient } from "../herdr/client.js";
 import { PairingStore } from "../pairing.js";
 import { TurnEngine } from "../turn.js";
 import { CommandHandler, stripComposerAttribution, stripMention } from "../commands.js";
 import { BackgroundWatcher } from "../watcher.js";
 import { WsRpc } from "../ws/rpc.js";
+import { acquireSingleInstanceLock } from "./lock.js";
 import { narrowedMaxFileBytes, WsNotifier } from "./notifier.js";
 
 function wsUrlFor(hubUrl: string): string {
@@ -23,8 +24,7 @@ function wsUrlFor(hubUrl: string): string {
  * so no extra config is needed for this to just work.
  */
 function pairingStorePathFor(hubUrl: string): string {
-  const safe = hubUrl.replace(/[^a-zA-Z0-9]/g, "-");
-  return join(homedir(), ".cctag", `pairings-${safe}.json`);
+  return join(homedir(), ".cctag", `pairings-${hubSlug(hubUrl)}.json`);
 }
 
 // Liveness detection timings, hand-rolled with plain setTimeout rather than
@@ -285,6 +285,7 @@ const STABLE_CONNECTION_MS = 10_000;
 
 async function main() {
   const config = loadSpokeConfig();
+  acquireSingleInstanceLock(config.hubUrl);
   console.log(`[spoke] connecting to ${config.hubUrl} as owner ${config.ownerUserId}...`);
 
   let backoffMs = 1_000;
