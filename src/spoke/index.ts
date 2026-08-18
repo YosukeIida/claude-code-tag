@@ -2,14 +2,14 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
 import type { AttachmentLimits, IncomingFile } from "../attachments.js";
-import { hubSlug, loadSpokeConfig } from "../config.js";
+import type { SpokeConfig } from "../config.js";
 import { HerdrClient } from "../herdr/client.js";
 import { PairingStore } from "../pairing.js";
 import { TurnEngine } from "../turn.js";
 import { CommandHandler, stripComposerAttribution, stripMention } from "../commands.js";
 import { BackgroundWatcher } from "../watcher.js";
+import { VERSION } from "../version.js";
 import { WsRpc } from "../ws/rpc.js";
-import { acquireSingleInstanceLock } from "./lock.js";
 import { narrowedMaxFileBytes, WsNotifier } from "./notifier.js";
 
 function wsUrlFor(hubUrl: string): string {
@@ -21,10 +21,13 @@ function wsUrlFor(hubUrl: string): string {
  * CCTAG_ENV_FILE — see config.ts). All of them talk to the same local herdr
  * daemon, so they'd silently clobber each other's pairing state if they
  * shared one `~/.cctag/pairings.json`. Namespace it by Hub URL automatically
- * so no extra config is needed for this to just work.
+ * so no extra config is needed for this to just work. Takes the already-
+ * sanitized slug rather than a raw Hub URL — see main()'s dynamic import of
+ * `hubSlug` for why the sanitizing call itself can't happen at this file's
+ * module top level.
  */
-function pairingStorePathFor(hubUrl: string): string {
-  return join(homedir(), ".cctag", `pairings-${hubSlug(hubUrl)}.json`);
+function pairingStorePathFor(slug: string): string {
+  return join(homedir(), ".cctag", `pairings-${slug}.json`);
 }
 
 // Liveness detection timings, hand-rolled with plain setTimeout rather than
@@ -38,9 +41,9 @@ const CONNECT_TIMEOUT_MS = 15_000;
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const PONG_TIMEOUT_MS = 90_000;
 
-function connectOnce(config: ReturnType<typeof loadSpokeConfig>): Promise<void> {
+function connectOnce(config: SpokeConfig, pairingStorePath: string): Promise<void> {
   const herdr = new HerdrClient(config.herdrBin);
-  const pairingStore = new PairingStore(pairingStorePathFor(config.hubUrl));
+  const pairingStore = new PairingStore(pairingStorePath);
 
   return new Promise((resolve, reject) => {
     // Sent as a header rather than a URL query param — query strings
@@ -221,6 +224,12 @@ function connectOnce(config: ReturnType<typeof loadSpokeConfig>): Promise<void> 
         const result = await rpc.call<{ ok: boolean; maxFileBytes?: number }>("register", {
           ownerUserId: config.ownerUserId,
           pairings: pairingStore.list().map((p) => ({ channel: p.channel, threadTs: p.threadTs })),
+          // Hub-side handling already tolerates unknown fields, so this is
+          // safe against an older Hub. Purely diagnostic: a recent incident
+          // investigation had no way to tell which Spoke build was talking
+          // to the Hub and had to reconstruct the timeline from unified log
+          // DNS resolution instead of a version string in a log line.
+          version: VERSION,
         });
         if (!result.ok) {
           throw new Error(
@@ -284,15 +293,34 @@ function connectOnce(config: ReturnType<typeof loadSpokeConfig>): Promise<void> 
 const STABLE_CONNECTION_MS = 10_000;
 
 async function main() {
+  // Checked before anything else — including the config/lock imports below,
+  // which are dynamic specifically so this path never triggers them.
+  // config.ts searches for and reads an env file as a module-level side
+  // effect the moment it's imported, so a static import of it anywhere in
+  // this file would run that search (and log a line about it) on every
+  // `--version` invocation too — and lock.js (already-merged, unmodified)
+  // itself statically imports from config.js for its own hubSlug use, so
+  // importing *it* statically would transitively cause the same problem.
+  // Importing both lazily, only once we know we're not just printing the
+  // version, keeps `--version` from touching config loading, the
+  // single-instance lock, Hub connection, or anything else in this file.
+  if (process.argv.includes("--version") || process.argv.includes("-v")) {
+    console.log(VERSION);
+    process.exit(0);
+  }
+
+  const { loadSpokeConfig, hubSlug } = await import("../config.js");
+  const { acquireSingleInstanceLock } = await import("./lock.js");
   const config = loadSpokeConfig();
   acquireSingleInstanceLock(config.hubUrl);
+  const pairingStorePath = pairingStorePathFor(hubSlug(config.hubUrl));
   console.log(`[spoke] connecting to ${config.hubUrl} as owner ${config.ownerUserId}...`);
 
   let backoffMs = 1_000;
   for (;;) {
     const connectedAt = Date.now();
     try {
-      await connectOnce(config);
+      await connectOnce(config, pairingStorePath);
       if (Date.now() - connectedAt >= STABLE_CONNECTION_MS) {
         backoffMs = 1_000;
       }
