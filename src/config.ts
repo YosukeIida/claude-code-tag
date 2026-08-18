@@ -32,6 +32,17 @@ export function resolveEnvFile(candidates: Array<string | undefined>, exists: (p
   return undefined;
 }
 
+/**
+ * Turns a Hub URL into a filename-safe token, so per-Hub state living in
+ * `~/.cctag/` (pairing store, single-instance lock, ...) can be namespaced
+ * without extra config. Shared by every such file on purpose: the names are
+ * effectively a persisted format, so the sanitizing rule must stay in one
+ * place rather than being re-derived (and drifting) at each call site.
+ */
+export function hubSlug(hubUrl: string): string {
+  return hubUrl.replace(/[^a-zA-Z0-9]/g, "-");
+}
+
 // Fixed, cwd-independent search order — read the FIRST match only. This
 // exists so a single-binary install finds its config without either failing
 // outright or silently reading an unrelated `.env` from whatever directory
