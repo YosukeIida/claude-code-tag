@@ -27,9 +27,9 @@ function pairingStorePathFor(hubUrl: string): string {
   return join(homedir(), ".cctag", `pairings-${safe}.json`);
 }
 
-// Liveness detection timings, hand-rolled with setTimeout/setInterval rather
-// than `ws` constructor options (handshakeTimeout etc.): this project ships
-// a Bun-compiled native binary (scripts/build-native.sh), and Bun silently
+// Liveness detection timings, hand-rolled with plain setTimeout rather than
+// `ws` constructor options (handshakeTimeout etc.): this project ships a
+// Bun-compiled native binary (scripts/build-native.sh), and Bun silently
 // ignores `ws` options it hasn't implemented — measured directly, an
 // unreachable-host connect with handshakeTimeout errors out under Node in 3s
 // but sits there doing nothing under Bun after 8s+. An option that quietly
@@ -60,7 +60,7 @@ function connectOnce(config: ReturnType<typeof loadSpokeConfig>): Promise<void> 
     // and a `timedOut` flag guards against a late "open" starting a second
     // engine/watcher pair against a connection this function has already
     // given up on.
-    let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+    let heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
     let timedOut = false;
     const connectTimeout = setTimeout(() => {
       console.log(`[spoke] connect timed out after ${CONNECT_TIMEOUT_MS / 1000}s, terminating`);
@@ -98,18 +98,28 @@ function connectOnce(config: ReturnType<typeof loadSpokeConfig>): Promise<void> 
       // (Unlike the connect-hang case above, terminate() on an already-OPEN
       // socket does reliably emit "close" under both Node and Bun — measured
       // — so this half relies on the close handler below, same as before.)
+      //
+      // A single rescheduled setTimeout, not setInterval: the same reasoning
+      // as the connect timeout above applies to every timer in this
+      // function — hand-rolled, not a `ws`/WebSocket constructor option —
+      // and setInterval doesn't buy anything setTimeout doesn't here, so
+      // there is no reason to reach for the fixed-cadence primitive.
       let lastPongAt = Date.now();
       ws.on("pong", () => {
         lastPongAt = Date.now();
       });
-      heartbeatTimer = setInterval(() => {
-        if (Date.now() - lastPongAt > PONG_TIMEOUT_MS) {
-          console.log(`[spoke] no pong in ${PONG_TIMEOUT_MS / 1000}s, terminating`);
-          ws.terminate();
-          return;
-        }
-        ws.ping();
-      }, HEARTBEAT_INTERVAL_MS);
+      const scheduleHeartbeatCheck = () => {
+        heartbeatTimer = setTimeout(() => {
+          if (Date.now() - lastPongAt > PONG_TIMEOUT_MS) {
+            console.log(`[spoke] no pong in ${PONG_TIMEOUT_MS / 1000}s, terminating`);
+            ws.terminate();
+            return;
+          }
+          ws.ping();
+          scheduleHeartbeatCheck();
+        }, HEARTBEAT_INTERVAL_MS);
+      };
+      scheduleHeartbeatCheck();
 
       const rpc = new WsRpc(ws);
       const notifier = new WsNotifier(rpc);
@@ -240,7 +250,7 @@ function connectOnce(config: ReturnType<typeof loadSpokeConfig>): Promise<void> 
         // same panes, which is exactly what abortAll() exists to prevent.
         watcher.stop();
         turnEngine.abortAll();
-        if (heartbeatTimer) clearInterval(heartbeatTimer);
+        if (heartbeatTimer) clearTimeout(heartbeatTimer);
         try {
           ws.close();
         } catch {
@@ -256,7 +266,7 @@ function connectOnce(config: ReturnType<typeof loadSpokeConfig>): Promise<void> 
       // them here so nothing leaks across reconnects (a stale heartbeat
       // interval would ping a socket that's already gone).
       clearTimeout(connectTimeout);
-      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (heartbeatTimer) clearTimeout(heartbeatTimer);
       console.log(`[spoke] disconnected from hub (code ${code}${reason ? `: ${reason}` : ""})`);
       resolve();
     });
