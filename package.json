@@ -9,6 +9,7 @@
     "node": ">=20"
   },
   "scripts": {
+    "prebuild": "node scripts/generate-version.mjs",
     "postinstall": "node scripts/generate-version.mjs",
     "dev": "tsx watch src/index.ts",
     "dev:hub": "tsx watch src/hub/index.ts",
