@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 Instructions for Claude Code working in this repository. Everything about *what
 a good change looks like* is in [CONTRIBUTING.md](CONTRIBUTING.md) and applies
