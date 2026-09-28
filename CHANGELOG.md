@@ -13,6 +13,11 @@ would have to keep. Pin an exact version if that matters to you.
 
 ### Fixed
 
+- Interrupting Claude Code now ends the turn. The transcript records an
+  interrupt as a user message beginning `[Request interrupted by user`, which
+  was read as a new turn starting: the transcript never said the interrupted
+  turn had ended. It is now an `aborted` boundary, as Codex's `turn_aborted`
+  already was.
 - The Hub's file cap now bounds what it will read, not just what it will accept.
   `CCTAG_MAX_FILE_MB` was compared only after a frame had been received and
   parsed, so an oversized upload was rejected having already cost the memory —
