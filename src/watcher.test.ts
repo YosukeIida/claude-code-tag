@@ -5,24 +5,76 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { BackgroundWatcher } from "./watcher.js";
 import { PairingStore, type Pairing } from "./pairing.js";
-import type { HerdrClient } from "./herdr/client.js";
-import type { AgentInfo } from "./herdr/types.js";
+import type { Terminals } from "./backend/index.js";
+import type { AgentInfo, AgentStatus } from "./backend/types.js";
 import type { MessageHandle, Notifier } from "./notifier.js";
 import type { TurnEngine } from "./turn.js";
 import { encodeCwd } from "./agents/claude/transcript.js";
 
 const PANE = "wG:p1";
 
-function fakeAgent(): AgentInfo {
+function fakeAgent(
+  status: AgentStatus = "idle",
+  cwd = "/tmp/nonexistent-cctag-test",
+): AgentInfo {
   return {
+    ref: { target: PANE, pid: null, processStartedAt: null },
+    backend: "herdr",
     agent: "claude",
     sessionId: "s1",
-    agentStatus: "idle",
-    cwd: "/tmp/nonexistent-cctag-test",
+    evidence: { kind: "classified", status },
+    cwd,
     terminalTitle: null,
-    paneId: PANE,
-    terminalId: "term_gone",
-    workspaceId: "wG",
+    terminalId: "herdr-terminal-id",
+    displayId: PANE,
+  };
+}
+
+function fakeTerminals(
+  agent: () => AgentInfo | null | Promise<AgentInfo | null> = () => fakeAgent(),
+  paneExists: () => boolean | Promise<boolean> = () => true,
+): Terminals {
+  return {
+    async list() {
+      return { agents: [], failures: [], complete: true, notices: [] };
+    },
+    async get() {
+      return agent();
+    },
+    async exists() {
+      return paneExists();
+    },
+    async read() {
+      return { text: "", draft: null, complete: true };
+    },
+    async submit() {
+      return "accepted";
+    },
+    openAnswer() {
+      return {
+        async digit() {},
+        async text() {},
+        async move() {},
+        async confirm() {},
+        complete() {},
+      };
+    },
+    openModelAnswer() {
+      return {
+        async digit() {},
+        async text() {},
+        async move() {},
+        async confirm() {},
+        complete() {},
+        async escape() {},
+      };
+    },
+    openBlind() {
+      return { async answer() {} };
+    },
+    openComposer() {
+      return { async backTab() {} };
+    },
   };
 }
 
@@ -74,14 +126,10 @@ test("a pane that has gone away is reported once and unpaired", async () => {
   try {
     const store = storeWithPairing(dir);
     const { notifier, replies } = fakeNotifier();
-    const herdr = {
-      async agentGet() {
-        return null; // herdr's own "no such pane"
-      },
-      async paneExists() {
-        return false; // and the pane itself is gone too
-      },
-    } as unknown as HerdrClient;
+    const herdr = fakeTerminals(
+      () => null,
+      () => false,
+    );
 
     const watcher = new BackgroundWatcher(herdr, store, idleEngine, notifier, 20);
     watcher.start();
@@ -97,7 +145,7 @@ test("a pane that has gone away is reported once and unpaired", async () => {
 });
 
 test("a herdr error is not reported as a closed terminal", async () => {
-  // The distinction that matters: agentGet() returns null only for herdr's own
+  // The distinction that matters: Herdr's `Terminals.get()` returns null only for its own
   // no-such-pane answer, and throws for a timeout or spawn failure. Treating the
   // second as a closed terminal would unpair a live thread whenever herdr
   // hiccuped — e.g. while it restarts after a Homebrew update.
@@ -105,11 +153,9 @@ test("a herdr error is not reported as a closed terminal", async () => {
   try {
     const store = storeWithPairing(dir);
     const { notifier, replies } = fakeNotifier();
-    const herdr = {
-      async agentGet(): Promise<never> {
-        throw new Error("herdr command timed out");
-      },
-    } as unknown as HerdrClient;
+    const herdr = fakeTerminals(async () => {
+      throw new Error("herdr command timed out");
+    });
 
     const watcher = new BackgroundWatcher(herdr, store, idleEngine, notifier, 20);
     watcher.start();
@@ -128,15 +174,8 @@ test("a herdr error is not reported as a closed terminal", async () => {
 /** A live pane with nothing running in it: `agent get` finds no agent, but the
  *  pane itself is still there — what quitting the CLI looks like, and equally
  *  what exiting it for good looks like. */
-function agentlessHerdr(): HerdrClient {
-  return {
-    async agentGet() {
-      return null;
-    },
-    async paneExists() {
-      return true;
-    },
-  } as unknown as HerdrClient;
+function agentlessTerminals(): Terminals {
+  return fakeTerminals(() => null, () => true);
 }
 
 test("a pane whose agent quit is kept while the CLI could still be restarting", async () => {
@@ -148,7 +187,7 @@ test("a pane whose agent quit is kept while the CLI could still be restarting", 
     const store = storeWithPairing(dir);
     const { notifier, replies } = fakeNotifier();
 
-    const watcher = new BackgroundWatcher(agentlessHerdr(), store, idleEngine, notifier, 20, 10_000);
+    const watcher = new BackgroundWatcher(agentlessTerminals(), store, idleEngine, notifier, 20, 10_000);
     watcher.start();
     await sleep(150); // several ticks, all well inside the grace period
     watcher.stop();
@@ -169,7 +208,7 @@ test("a pane still agentless after the grace period is unpaired and reported onc
     const store = storeWithPairing(dir);
     const { notifier, replies } = fakeNotifier();
 
-    const watcher = new BackgroundWatcher(agentlessHerdr(), store, idleEngine, notifier, 20, 40);
+    const watcher = new BackgroundWatcher(agentlessTerminals(), store, idleEngine, notifier, 20, 40);
     watcher.start();
     await sleep(300); // ticks past the 40ms grace, then keeps ticking
     watcher.stop();
@@ -198,15 +237,13 @@ test("an agent coming back inside the grace period resets the wait", async () =>
     // version of this test put those two answers ~10ms apart and failed
     // whenever a tick landed on the wrong side of the boundary.
     let calls = 0;
-    const herdr = {
-      async agentGet() {
+    const herdr = fakeTerminals(
+      () => {
         calls += 1;
         return calls === 1 || calls >= 7 ? null : fakeAgent();
       },
-      async paneExists() {
-        return true;
-      },
-    } as unknown as HerdrClient;
+      () => true,
+    );
 
     const watcher = new BackgroundWatcher(herdr, store, idleEngine, notifier, 50, 200);
     watcher.start();
@@ -231,12 +268,10 @@ test("a pairing from before pane-id addressing is diagnosed as stale, not as a c
     store.add({ ...fakePairing(), paneId: undefined as unknown as string });
     const { notifier, replies } = fakeNotifier();
     let queried = 0;
-    const herdr = {
-      async agentGet() {
-        queried += 1;
-        return null;
-      },
-    } as unknown as HerdrClient;
+    const herdr = fakeTerminals(() => {
+      queried += 1;
+      return null;
+    });
 
     const watcher = new BackgroundWatcher(herdr, store, idleEngine, notifier, 20);
     watcher.start();
@@ -286,12 +321,8 @@ function writeCompletedTurn(dir: string, name: string, text: string): void {
 }
 
 /** A pane reporting no session id, whose status the test can flip. */
-function rotatingHerdr(cwd: string, status: () => AgentInfo["agentStatus"]): HerdrClient {
-  return {
-    async agentGet() {
-      return { ...fakeAgent(), sessionId: null, cwd, agentStatus: status() };
-    },
-  } as unknown as HerdrClient;
+function rotatingTerminals(cwd: string, status: () => AgentStatus): Terminals {
+  return fakeTerminals(() => ({ ...fakeAgent(status(), cwd), sessionId: null }));
 }
 
 /** An engine stand-in whose pane can be reported busy for one tick, standing in
@@ -317,7 +348,7 @@ async function withRotationFixture(
     tDir: string;
     store: PairingStore;
     replies: string[];
-    setStatus: (s: AgentInfo["agentStatus"]) => void;
+    setStatus: (s: AgentStatus) => void;
     /** Report the pane busy for the next N ticks, as a Slack turn would. */
     setBusy: (ticks: number) => void;
     /** Make the transcript directory unresolvable, as a transient failure would. */
@@ -329,7 +360,7 @@ async function withRotationFixture(
   const tDir = transcriptDirFor(cwd);
   const hiddenDir = tDir + "-hidden";
   const storeDir = mkdtempSync(join(tmpdir(), "cctag-rot-store-"));
-  let status: AgentInfo["agentStatus"] = "working";
+  let status: AgentStatus = "working";
   let watcher: BackgroundWatcher | undefined;
   const { engine, setBusy } = engineBusyOnce();
   try {
@@ -350,7 +381,7 @@ async function withRotationFixture(
       },
       start: () => {
         watcher = new BackgroundWatcher(
-          rotatingHerdr(cwd, () => status),
+          rotatingTerminals(cwd, () => status),
           store,
           engine,
           notifier,
@@ -539,14 +570,10 @@ test("a pane whose CLI was quit keeps its pairing", async () => {
   try {
     const store = storeWithPairing(dir);
     const { notifier, replies } = fakeNotifier();
-    const herdr = {
-      async agentGet() {
-        return null; // no agent...
-      },
-      async paneExists() {
-        return true; // ...but the pane is still there
-      },
-    } as unknown as HerdrClient;
+    const herdr = fakeTerminals(
+      () => null, // no agent...
+      () => true, // ...but the pane is still there
+    );
 
     const watcher = new BackgroundWatcher(herdr, store, idleEngine, notifier, 20);
     watcher.start();
@@ -565,14 +592,10 @@ test("a pane that is really gone is still unpaired", async () => {
   try {
     const store = storeWithPairing(dir);
     const { notifier, replies } = fakeNotifier();
-    const herdr = {
-      async agentGet() {
-        return null;
-      },
-      async paneExists() {
-        return false;
-      },
-    } as unknown as HerdrClient;
+    const herdr = fakeTerminals(
+      () => null,
+      () => false,
+    );
 
     const watcher = new BackgroundWatcher(herdr, store, idleEngine, notifier, 20);
     watcher.start();
@@ -668,7 +691,7 @@ test("a file already uploaded is not handed over again on the next settle", asyn
     store.add({ ...fakePairing(), cwd });
     const { notifier } = fakeNotifier();
     const { engine, handovers } = uploadRecordingEngine();
-    const watcher = new BackgroundWatcher(rotatingHerdr(cwd, () => "working"), store, engine, notifier, 20);
+    const watcher = new BackgroundWatcher(rotatingTerminals(cwd, () => "working"), store, engine, notifier, 20);
 
     // Written only after the watch exists: a transcript that was already there
     // when watching began is deliberately never replayed.

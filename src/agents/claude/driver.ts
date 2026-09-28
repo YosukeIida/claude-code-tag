@@ -1,7 +1,9 @@
+import { promptFingerprint } from "../fingerprint.js";
 import type { AgentDriver, AskUserQuestionPaneInfo, BlockedPrompt } from "../driver.js";
-import type { HerdrClient } from "../../herdr/client.js";
+import type { Terminals } from "../../backend/index.js";
+import { createBlindPermissionPrompt, createVerifiedPrompt } from "../../backend/prompt.js";
+import { ExpectationLost, type AgentInfo } from "../../backend/types.js";
 import {
-  BACKTAB,
   findPlanFeedbackOption,
   MODE_ALIASES,
   MODE_RING,
@@ -15,6 +17,7 @@ import {
   classicAnchorIndex,
   permissionAnchorIndex,
   previewAnchorIndex,
+  parseCursorLabel as parseClaudeCursorLabel,
   stripFooterChrome,
 } from "./prompts.js";
 import {
@@ -43,6 +46,11 @@ function sameQuestion(
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+function assertAnswerNotAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new ExpectationLost("the compound answer was interrupted before completion");
+  }
+}
 
 /**
  * Runs a CLI slash command (`/model <name>`, ...) rather than a normal
@@ -54,43 +62,51 @@ function sleep(ms: number): Promise<void> {
  * that intent.
  */
 async function runClaudeSlashCommand(
-  herdr: HerdrClient,
-  agent: { paneId: string },
+  terminals: Terminals,
+  driver: AgentDriver,
+  agent: AgentInfo,
   command: string,
 ): Promise<string> {
   // Atomic submit — same reason as TurnEngine.startTurn: a separate
   // send-text + Enter races Claude Code's paste coalescing and can leave the
-  // command unsent. agent prompt sequences text + Enter server-side.
-  await herdr.agentPrompt(agent.paneId, command);
+  // command unsent. Terminals.submit keeps it one server-side operation.
+  await terminals.submit(agent.ref, command, {
+    driver,
+    cancelled: () => false,
+    transcriptGrew: () => false,
+    retryLimit: 0,
+    pollIntervalMs: 0,
+  });
 
   let settled = false;
   for (let i = 0; i < 10 && !settled; i++) {
     await sleep(600);
-    const cur = await herdr.agentGet(agent.paneId);
+    const cur = await terminals.get(agent.ref.target);
     if (!cur) break;
 
     // Some confirmation menus — notably "Switch model? ... this
     // conversation is cached, switching means the full history gets
-    // re-read" — don't flip agentStatus to "blocked" the way ordinary
-    // permission/AskUserQuestion prompts do; herdr keeps reporting "idle"
-    // while the menu sits on screen waiting for input (verified
-    // empirically: status stayed "idle" for the entire time the dialog was
-    // up). So check the pane for a parseable menu on every iteration, not
-    // only when status says "blocked" — otherwise this dialog is mistaken
-    // for "already settled" and left unanswered.
-    const paneText = await herdr.paneRead(agent.paneId, { source: "recent", lines: 40 });
+    // re-read" — Herdr keeps classifying this menu as `idle` rather than
+    // `blocked` (verified empirically). So inspect the pane for a parseable menu
+    // on every iteration, not only when status says `blocked` — otherwise this
+    // dialog is mistaken for "already settled" and left unanswered.
+    const paneText = (await terminals.read(agent.ref.target, 40, "history")).text;
     const menu = parsePermissionMenu(paneText);
     if (menu && menu.choices.length > 0) {
-      await herdr.agentSend(agent.paneId, menu.choices[0].num);
+      const parsed = driver.parseBlockedPane(paneText);
+      if (parsed.kind === "question" || parsed.kind === "permission") {
+        await terminals.openAnswer(agent.ref, parsed.verified).digit(Number(menu.choices[0].num));
+      }
       continue;
     }
 
-    if (cur.agentStatus === "idle" || cur.agentStatus === "done") {
+    const status = cur.evidence.kind === "classified" ? cur.evidence.status : "unknown";
+    if (status === "idle" || status === "done") {
       settled = true;
     }
   }
 
-  const raw = await herdr.paneRead(agent.paneId, { source: "recent", lines: 40 });
+  const raw = (await terminals.read(agent.ref.target, 40, "history")).text;
   const snippet = stripFooterChrome(raw);
   return "```\n" + snippet.slice(-1500) + "\n```";
 }
@@ -98,7 +114,7 @@ async function runClaudeSlashCommand(
 export const claudeDriver: AgentDriver = {
   kind: "claude",
   displayName: "Claude Code",
-  paneReadSource: "recent",
+  readRegion: "history",
 
   locateTranscript(cwd, sessionId) {
     return locateClaudeTranscript(cwd, sessionId);
@@ -125,9 +141,13 @@ export const claudeDriver: AgentDriver = {
     // live preview question win, and a stale preview question above a live
     // permission menu do the same: the wrong prompt was posted, or the right one
     // never was.
-    const candidates: { at: number; parse: () => AskUserQuestionPaneInfo | null }[] = [
-      { at: classicAnchorIndex(paneText), parse: () => parseAskUserQuestionPane(paneText) },
-      { at: previewAnchorIndex(paneText), parse: () => parsePreviewQuestionPane(paneText) },
+    const candidates: {
+      at: number;
+      form: "digit-confirms" | "digit-then-enter";
+      parse: () => AskUserQuestionPaneInfo | null;
+    }[] = [
+      { at: classicAnchorIndex(paneText), form: "digit-confirms", parse: () => parseAskUserQuestionPane(paneText) },
+      { at: previewAnchorIndex(paneText), form: "digit-then-enter", parse: () => parsePreviewQuestionPane(paneText) },
     ];
     const permissionAt = permissionAnchorIndex(paneText);
     for (const candidate of candidates.filter((c) => c.at >= 0).sort((a, b) => b.at - a.at)) {
@@ -135,30 +155,62 @@ export const claudeDriver: AgentDriver = {
       // its own options are numbered too, so it must not be parsed as one.
       if (permissionAt > candidate.at) break;
       const info = candidate.parse();
-      if (info) return { kind: "question", info };
+      if (info) {
+        const content = { kind: "question" as const, info };
+        const fingerprint = promptFingerprint(content);
+        if (fingerprint === null) return { kind: "unreadable-question" };
+        return {
+          ...content,
+          verified: createVerifiedPrompt(
+            fingerprint,
+            claudeDriver,
+            info.multiSelect ? "compound" : candidate.form,
+          ),
+        };
+      }
     }
     const menu = parsePermissionMenu(paneText);
+    if (!menu) {
+      return looksLikeQuestionScreen(paneText)
+        ? { kind: "unreadable-question" }
+        : { kind: "blind-permission", blind: createBlindPermissionPrompt(claudeDriver) };
+    }
     const feedbackNum = findPlanFeedbackOption(paneText);
-    return {
-      kind: "permission",
+    const content = {
+      kind: "permission" as const,
       menu,
       isPlanPrompt: feedbackNum !== null,
       planFeedbackOptionNum: feedbackNum ?? undefined,
     };
+    const fingerprint = promptFingerprint(content);
+    if (fingerprint === null) {
+      return { kind: "blind-permission", blind: createBlindPermissionPrompt(claudeDriver) };
+    }
+    return {
+      ...content,
+      verified: createVerifiedPrompt(
+        fingerprint,
+        claudeDriver,
+        feedbackNum === null ? "digit-confirms" : "compound",
+      ),
+    };
+  },
+  parseCursorLabel(snap) {
+    return snap.complete ? parseClaudeCursorLabel(snap.text) : null;
   },
 
-  async answerOption(herdr, paneId, value) {
-    await herdr.agentSend(paneId, value);
+  async answerOption(channel, value, _expectedLabel) {
+    await channel.digit(Number(value));
   },
 
-  async answerQuestionOption(herdr, paneId, optionNum, answered, signal) {
-    await herdr.agentSend(paneId, String(optionNum));
+  async answerQuestionOption(terminals, channel, target, optionNum, answered, signal) {
+    await channel.digit(optionNum);
     await sleep(400);
     // Deliberately not caught. Without a successful read there is no way to know
     // whether the digit confirmed, and reporting success would let the caller
     // mark the Slack prompt answered while the pane still waits — the prompt
     // would then be re-posted on the next poll. Throwing leaves it answerable.
-    const after = await herdr.paneRead(paneId, { source: "recent", lines: 200 });
+    const after = (await terminals.read(target, 200, "history")).text;
 
     // Whether that digit already confirmed depends on which renderer drew the
     // question, and the two are chosen per question, so the pane is the only
@@ -177,13 +229,13 @@ export const claudeDriver: AgentDriver = {
     // holder releases as soon as it is asked to stop, and this runs outside that
     // loop. A read is harmless, a keystroke is not.
     if (signal?.aborted) return;
-    await herdr.paneSendKeys(paneId, "Enter");
+    const expectedLabel = answered.options[optionNum - 1]?.label;
+    if (expectedLabel !== undefined) await channel.confirm(expectedLabel);
   },
 
-  async answerQuestionMultiSelect(herdr, paneId, optionNums, info, signal) {
+  async answerQuestionMultiSelect(terminals, channel, ref, optionNums, info, signal) {
     // Every step below was measured on a live multi-select dialog (Claude Code
     // 2.1.251), not inferred from the single-select path — the last multi-select
-    // bug came from a fixture written by assumption, so this one is a capture.
     //
     //     ❯ 1. [ ] Alpha        <- a digit toggles this to [✔] and does NOT
     //       2. [ ] Bravo           move the cursor or submit
@@ -191,8 +243,10 @@ export const claudeDriver: AgentDriver = {
     //       4. [ ] Delta
     //       5. [ ] Type something
     //          Submit           <- Down × (options.length + 1) lands here
+    assertAnswerNotAborted(signal);
     for (const num of optionNums) {
-      await herdr.agentSend(paneId, String(num));
+      assertAnswerNotAborted(signal);
+      await channel.digit(num);
       await sleep(150);
     }
 
@@ -200,10 +254,11 @@ export const claudeDriver: AgentDriver = {
     // cursor has not moved (the digits do not move it), so this count is from
     // row 1 every time. answerQuestionFreeText uses options.length downs to
     // reach the free-text row, which is the same geometry one row up.
-    await herdr.paneSendKeys(paneId, ...Array(info.options.length + 1).fill("Down"));
+    assertAnswerNotAborted(signal);
+    await channel.move("Down", info.options.length + 1);
     await sleep(200);
-    if (signal?.aborted) return;
-    await herdr.paneSendKeys(paneId, "Enter");
+    assertAnswerNotAborted(signal);
+    await channel.confirm("Submit", false);
 
     // Enter on Submit does not finish the dialog: a review screen appears —
     //
@@ -217,23 +272,25 @@ export const claudeDriver: AgentDriver = {
     // answerQuestionOption; anything other than the review screen is left alone
     // for the poll loop to post.
     await sleep(500);
-    if (signal?.aborted) return;
-    const after = await herdr.paneRead(paneId, { source: "recent", lines: 60 });
-    if (!SUBMIT_ANSWERS_RE.test(after)) return;
-    if (signal?.aborted) return;
-    await herdr.agentSend(paneId, "1");
+    assertAnswerNotAborted(signal);
+    const after = (await terminals.read(ref.target, 60, "history")).text;
+    assertAnswerNotAborted(signal);
+    if (!SUBMIT_ANSWERS_RE.test(after)) {
+      channel.complete();
+      return;
+    }
+    await channel.digit(1, true);
   },
 
-  async answerQuestionFreeText(herdr, paneId, info, text) {
+  async answerQuestionFreeText(terminals, channel, ref, info, text) {
     // Navigate down to the "Type something" row (the free-text row must be
     // reached via arrows and then have its placeholder replaced before Enter).
-    const downs = Array(info.options.length).fill("Down");
-    if (downs.length) await herdr.paneSendKeys(paneId, ...downs);
-    await herdr.agentSend(paneId, text);
+    if (info.options.length > 0) await channel.move("Down", info.options.length);
+    await channel.text(text);
     await sleep(200);
 
     if (!info.multiSelect) {
-      await herdr.paneSendKeys(paneId, "Enter");
+      await channel.confirm(text);
       return;
     }
 
@@ -247,24 +304,26 @@ export const claudeDriver: AgentDriver = {
     // unsubmitted — reported from production as "replying 1,3 didn't work".
     // Submitting is the same walk as answerQuestionMultiSelect's: one more Down
     // onto Submit, Enter, then confirm the review screen.
-    await herdr.paneSendKeys(paneId, "Down");
-    await sleep(150);
-    await herdr.paneSendKeys(paneId, "Enter");
+    await channel.move("Down", 1);
+    await channel.confirm("Submit", false);
     await sleep(500);
-    const after = await herdr.paneRead(paneId, { source: "recent", lines: 60 });
-    if (!SUBMIT_ANSWERS_RE.test(after)) return;
-    await herdr.agentSend(paneId, "1");
+    const after = (await terminals.read(ref.target, 60, "history")).text;
+    if (!SUBMIT_ANSWERS_RE.test(after)) {
+      channel.complete();
+      return;
+    }
+    await channel.digit(1, true);
   },
 
-  async answerPlanFeedback(herdr, paneId, optionNum, text) {
+  async answerPlanFeedback(channel, optionNum, text) {
     // Verified mechanics: send the option's digit to move the cursor there,
     // type the feedback — which replaces the option's placeholder label
     // inline — then Enter, which refines the plan and stays in plan mode.
-    await herdr.agentSend(paneId, String(optionNum));
+    await channel.digit(optionNum);
     await sleep(200);
-    await herdr.agentSend(paneId, text);
+    await channel.text(text);
     await sleep(200);
-    await herdr.paneSendKeys(paneId, "Enter");
+    await channel.confirm(text);
   },
 
   resolvePlanFile,
@@ -273,14 +332,14 @@ export const claudeDriver: AgentDriver = {
     ring: MODE_RING,
     aliases: MODE_ALIASES,
     parseCurrent: parseCurrentMode,
-    async cycle(herdr, paneId) {
+    async cycle(channel) {
       // herdr's `send-keys shift+tab` is a no-op for Claude Code; the raw
       // CSI Z sequence sent as text does work (verified empirically).
-      await herdr.paneSendText(paneId, BACKTAB);
+      await channel.backTab();
     },
   },
 
-  async runModelCommand(herdr, agent, argsText) {
-    return runClaudeSlashCommand(herdr, agent, `/model ${argsText}`);
+  async runModelCommand(terminals, agent, argsText) {
+    return runClaudeSlashCommand(terminals, claudeDriver, agent, `/model ${argsText}`);
   },
 };

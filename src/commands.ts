@@ -1,10 +1,12 @@
 import type { IncomingFile } from "./attachments.js";
-import type { HerdrClient } from "./herdr/client.js";
+import type { Terminals } from "./backend/index.js";
+import { ExpectationLost } from "./backend/types.js";
 import { PairingStore } from "./pairing.js";
 import type { TurnEngine } from "./turn.js";
 import type { Notifier } from "./notifier.js";
 import { agentPickerBlocks } from "./slack/blocks.js";
 import { driverFor, type AgentDriver } from "./agents/driver.js";
+import { classifiedStatus } from "./settle.js";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -70,8 +72,8 @@ function withOwnershipNote(lines: string[]): string[] {
 }
 
 /**
- * Help for a thread whose agent is not known — no pairing, or a pane herdr
- * cannot currently reach.
+ * Help for a thread whose agent is not known — no pairing, or when a backend
+ * cannot currently reach the target.
  *
  * Its own variant rather than the Claude one doing double duty. That sharing is
  * what produced the reported defect twice over: the text a first-time reader
@@ -122,8 +124,8 @@ const CODEX_HELP_TEXT = [
  * The help for a thread, by whichever agent it is paired to — and a third text
  * for when that is not known yet.
  *
- * `null` covers both a thread with no pairing and one whose pane herdr cannot
- * currently reach. Neither can be told what agent they are talking to, so
+ * `null` covers both a thread with no pairing and one whose backend cannot
+ * currently reach the target. Neither can be told what agent they are talking to,
  * neither should be shown an agent's specifics as though they applied. See
  * GENERIC_HELP_TEXT for what the Claude variant serving that role kept getting
  * wrong.
@@ -143,6 +145,7 @@ export function helpTextFor(driver: AgentDriver | null): string {
  */
 const BUSY_MESSAGE =
   "⏳ このインスタンスは実行中です（このスレッドの `⚙️ 実行中…` の行が現在の状態です）。完了すると結果が投稿されるので、それから送ってください。";
+const EXPECTATION_LOST_REPLY = "画面が変わったため、回答を途中で止めました。端末で確かめてください";
 
 const MODEL_COMMAND_RE = /^model\s+(\S[\s\S]*)$/i;
 const MODE_COMMAND_RE = /^mode\s+(\S+)$/i;
@@ -227,7 +230,7 @@ export interface FreeTextContext {
  */
 export class CommandHandler {
   constructor(
-    private readonly herdr: HerdrClient,
+    private readonly terminals: Terminals,
     private readonly pairingStore: PairingStore,
     private readonly turnEngine: TurnEngine,
     private readonly notifier: Notifier,
@@ -277,14 +280,14 @@ export class CommandHandler {
         return;
       }
       try {
-        const agent = await this.herdr.agentGet(pairing.paneId);
+        const agent = await this.terminals.get(pairing.paneId);
         if (!agent) {
           await this.notifier.postReply(channel, threadTs, "⚠️ インスタンスが見つかりません。");
           return;
         }
         if (lease.cancelled) return;
         const driver = driverFor(agent.agent);
-        const reply = await driver.runModelCommand(this.herdr, agent, modelMatch[1].trim());
+        const reply = await driver.runModelCommand(this.terminals, agent, modelMatch[1].trim());
         await this.notifier.postReply(channel, threadTs, reply);
       } finally {
         lease.release();
@@ -303,7 +306,7 @@ export class CommandHandler {
         );
         return;
       }
-      const agent = await this.herdr.agentGet(pairing.paneId);
+      const agent = await this.terminals.get(pairing.paneId);
       if (!agent) {
         await this.notifier.postReply(channel, threadTs, "⚠️ インスタンスが見つかりません。");
         return;
@@ -343,7 +346,7 @@ export class CommandHandler {
           );
           return;
         }
-        const agent = await this.herdr.agentGet(pairing.paneId);
+        const agent = await this.terminals.get(pairing.paneId);
         if (!agent) {
           await this.notifier.postReply(channel, threadTs, "⚠️ インスタンスが見つかりません。");
           return;
@@ -364,8 +367,13 @@ export class CommandHandler {
           await this.notifier.postReply(channel, threadTs, "⚠️ `connect` は cctag を動かしている本人（チャンネルの管理者ではありません）のみ実行できます。");
           return;
         }
-        const agents = await this.herdr.agentList();
-        await this.notifier.postMessage(channel, threadTs, "接続するインスタンスを選択してください", agentPickerBlocks(agents));
+        const result = await this.terminals.list();
+        await this.notifier.postMessage(
+          channel,
+          threadTs,
+          "接続するインスタンスを選択してください",
+          agentPickerBlocks(result),
+        );
         return;
       }
       case "disconnect": {
@@ -392,26 +400,30 @@ export class CommandHandler {
           await this.notifier.postReply(channel, threadTs, "このスレッドは接続されていません。");
           return;
         }
-        const agent = await this.herdr.agentGet(pairing.paneId);
+        const agent = await this.terminals.get(pairing.paneId);
         const statusLine = agent
-          ? `状態: ${agent.agentStatus} / cwd: ${agent.cwd}`
+          ? `状態: ${classifiedStatus(agent.evidence)} / cwd: ${agent.cwd}`
           : "⚠️ インスタンスが見つかりません（切断されている可能性があります）";
         await this.notifier.postReply(channel, threadTs, `🔗 接続先: ${pairing.cwd}\n${statusLine}`);
         return;
       }
       case "list": {
-        const agents = await this.herdr.agentList();
+        const result = await this.terminals.list();
         const pairings = this.pairingStore.list();
-        const lines = agents.map((a) => {
-          const paired = pairings.find((p) => p.paneId === a.paneId);
+        const agentLines = result.agents.map((agent) => {
+          const paired = pairings.find((pairing) => pairing.paneId === agent.ref.target);
           const mark = paired ? "🔗" : "・";
-          return `${mark} ${a.agentStatus.padEnd(8)} ${a.cwd}`;
+          return `${mark} ${classifiedStatus(agent.evidence).padEnd(8)} ${agent.cwd}`;
         });
-        await this.notifier.postReply(
-          channel,
-          threadTs,
-          lines.length ? "```\n" + lines.join("\n") + "\n```" : "稼働中のインスタンスがありません。",
-        );
+        const detailLines = [
+          ...result.failures.map((failure) => `⚠️ ${failure.backend}: ${failure.reason}`),
+          ...result.notices.map((notice) => `ℹ️ ${notice}`),
+        ];
+        if (!result.complete) detailLines.unshift("⚠️ インスタンス一覧は不完全です。");
+        const text = agentLines.length
+          ? `\`\`\`\n${[...agentLines, ...detailLines].join("\n")}\n\`\`\``
+          : ["稼働中のインスタンスがありません。", ...detailLines].join("\n");
+        await this.notifier.postReply(channel, threadTs, text);
         return;
       }
       case "help":
@@ -420,7 +432,7 @@ export class CommandHandler {
           const pairing = this.pairingStore.get(channel, threadTs);
           let driver: AgentDriver | null = null;
           if (pairing) {
-            const agent = await this.herdr.agentGet(pairing.paneId).catch(() => null);
+            const agent = await this.terminals.get(pairing.paneId).catch(() => null);
             driver = agent ? driverFor(agent.agent) : null;
           }
           await this.notifier.postReply(channel, threadTs, helpTextFor(driver));
@@ -516,13 +528,13 @@ export class CommandHandler {
       return;
     }
     try {
-      const agent = await this.herdr.agentGet(paneId);
+      const agent = await this.terminals.get(paneId);
       if (!agent) {
         await this.notifier.postReply(channel, threadTs, "⚠️ インスタンスが見つかりません。");
         return;
       }
       if (lease.cancelled) return;
-      let current = modes.parseCurrent(await this.herdr.paneRead(agent.paneId, { source: "recent", lines: 12 }));
+      let current = modes.parseCurrent((await this.terminals.read(agent.ref.target, 12, driver.readRegion)).text);
       if (current === null) {
         // Don't blind-cycle from an unknown state — pressing Shift+Tab would
         // change the mode with no way to know to what, or to restore it.
@@ -539,9 +551,9 @@ export class CommandHandler {
       // end up exactly where we began rather than in some other mode while
       // reporting failure.
       for (let i = 0; i < modes.ring.length && current !== target; i++) {
-        await modes.cycle(this.herdr, agent.paneId);
+        await modes.cycle(this.terminals.openComposer(agent.ref, driver));
         await sleep(400);
-        current = modes.parseCurrent(await this.herdr.paneRead(agent.paneId, { source: "recent", lines: 12 }));
+        current = modes.parseCurrent((await this.terminals.read(agent.ref.target, 12, driver.readRegion)).text);
       }
 
       if (current === target) {
@@ -636,13 +648,13 @@ export class CommandHandler {
       return;
     }
 
-    const agent = await this.herdr.agentGet(paneId);
+    const agent = await this.terminals.get(paneId);
     if (!agent) {
       await this.notifier.postReply(channel, threadTs, "⚠️ インスタンスが見つかりません。");
       return;
     }
 
-    const existing = this.pairingStore.byPane(paneId);
+    const existing = this.pairingStore.byPane(agent.ref.target);
     if (existing) {
       // The old pairing might be a zombie: its paneId can still exist in
       // herdr (e.g. Claude Code was exited and a new session started in the
@@ -674,7 +686,7 @@ export class CommandHandler {
       key: PairingStore.threadKey(channel, threadTs),
       channel,
       threadTs,
-      paneId,
+      paneId: agent.ref.target,
       terminalId: agent.terminalId,
       cwd: agent.cwd,
       agent: agent.agent,
@@ -701,7 +713,7 @@ export class CommandHandler {
   private async reportAgentMissing(channel: string, threadTs: string, pairing: { key: string; paneId: string }): Promise<void> {
     let paneStillThere = false;
     try {
-      paneStillThere = await this.herdr.paneExists(pairing.paneId);
+      paneStillThere = await this.terminals.exists(pairing.paneId);
     } catch {
       // Couldn't tell — assume the pane is there, since keeping a pairing is the
       // recoverable mistake and dropping one is not.
@@ -735,15 +747,20 @@ export class CommandHandler {
   }
 
   async handleAskUserQuestionButton(ctx: AskUserQuestionButtonContext): Promise<void> {
-    const result = await this.turnEngine.answerQuestionButton(
-      ctx.terminalId,
-      ctx.promptId,
-      ctx.optionIndex,
-      this.pairingStore.get(ctx.channel, ctx.threadTs)?.key,
-      this.actorLabel(ctx),
-    );
-    if (!result.ok) {
-      await this.notifier.postReply(ctx.channel, ctx.threadTs, "⚠️ この質問は既に回答済みです。");
+    try {
+      const result = await this.turnEngine.answerQuestionButton(
+        ctx.terminalId,
+        ctx.promptId,
+        ctx.optionIndex,
+        this.pairingStore.get(ctx.channel, ctx.threadTs)?.key,
+        this.actorLabel(ctx),
+      );
+      if (!result.ok) {
+        await this.notifier.postReply(ctx.channel, ctx.threadTs, "⚠️ この質問は既に回答済みです。");
+      }
+    } catch (err) {
+      if (!(err instanceof ExpectationLost)) throw err;
+      await this.notifier.postReply(ctx.channel, ctx.threadTs, EXPECTATION_LOST_REPLY);
     }
   }
 
@@ -760,28 +777,38 @@ export class CommandHandler {
       await this.notifier.postReply(ctx.channel, ctx.threadTs, "⚠️ 選択肢を1つ以上選んでから送信してください。");
       return;
     }
-    const result = await this.turnEngine.answerQuestionMultiSelect(
-      ctx.terminalId,
-      ctx.promptId,
-      ctx.optionIndices,
-      this.pairingStore.get(ctx.channel, ctx.threadTs)?.key,
-      this.actorLabel(ctx),
-    );
-    if (!result.ok) {
-      await this.notifier.postReply(ctx.channel, ctx.threadTs, "⚠️ この質問は既に回答済みです。");
+    try {
+      const result = await this.turnEngine.answerQuestionMultiSelect(
+        ctx.terminalId,
+        ctx.promptId,
+        ctx.optionIndices,
+        this.pairingStore.get(ctx.channel, ctx.threadTs)?.key,
+        this.actorLabel(ctx),
+      );
+      if (!result.ok) {
+        await this.notifier.postReply(ctx.channel, ctx.threadTs, "⚠️ この質問は既に回答済みです。");
+      }
+    } catch (err) {
+      if (!(err instanceof ExpectationLost)) throw err;
+      await this.notifier.postReply(ctx.channel, ctx.threadTs, EXPECTATION_LOST_REPLY);
     }
   }
 
   async handlePermissionButton(ctx: PermissionButtonContext): Promise<void> {
-    const result = await this.turnEngine.answerPermissionButton(
-      ctx.terminalId,
-      ctx.promptId,
-      ctx.num,
-      this.pairingStore.get(ctx.channel, ctx.threadTs)?.key,
-      this.actorLabel(ctx),
-    );
-    if (!result.ok) {
-      await this.notifier.postReply(ctx.channel, ctx.threadTs, "⚠️ このリクエストは既に処理済みです。");
+    try {
+      const result = await this.turnEngine.answerPermissionButton(
+        ctx.terminalId,
+        ctx.promptId,
+        ctx.num,
+        this.pairingStore.get(ctx.channel, ctx.threadTs)?.key,
+        this.actorLabel(ctx),
+      );
+      if (!result.ok) {
+        await this.notifier.postReply(ctx.channel, ctx.threadTs, "⚠️ このリクエストは既に処理済みです。");
+      }
+    } catch (err) {
+      if (!(err instanceof ExpectationLost)) throw err;
+      await this.notifier.postReply(ctx.channel, ctx.threadTs, EXPECTATION_LOST_REPLY);
     }
   }
 
@@ -799,9 +826,14 @@ export class CommandHandler {
   async handleFreeTextMessage(ctx: FreeTextContext): Promise<void> {
     const pairing = this.pairingStore.get(ctx.channel, ctx.threadTs);
     if (!pairing) return;
-    const asQuestion = await this.turnEngine.answerQuestionFreeText(pairing.paneId, ctx.text);
-    if (asQuestion.ok) return;
-    await this.turnEngine.answerPlanFeedback(pairing.paneId, ctx.text);
+    try {
+      const asQuestion = await this.turnEngine.answerQuestionFreeText(pairing.paneId, ctx.text);
+      if (asQuestion.ok) return;
+      await this.turnEngine.answerPlanFeedback(pairing.paneId, ctx.text);
+    } catch (err) {
+      if (!(err instanceof ExpectationLost)) throw err;
+      await this.notifier.postReply(ctx.channel, ctx.threadTs, EXPECTATION_LOST_REPLY);
+    }
   }
 }
 

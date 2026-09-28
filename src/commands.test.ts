@@ -2,11 +2,13 @@ import { randomInt } from "node:crypto";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CommandHandler } from "./commands.js";
-import type { HerdrClient } from "./herdr/client.js";
+import type { Terminals } from "./backend/index.js";
 import type { Notifier } from "./notifier.js";
 import type { Pairing, PairingStore } from "./pairing.js";
 import type { TurnEngine } from "./turn.js";
+import { ExpectationLost, type AgentInfo } from "./backend/types.js";
 
+const NO_TERMINALS = {} as Terminals;
 const OWNER = "U_OWNER";
 
 const BUTTON_PAIRING: Pairing = {
@@ -19,6 +21,53 @@ const BUTTON_PAIRING: Pairing = {
   pairedBy: OWNER,
   pairedAt: "2026-01-01T00:00:00.000Z",
 };
+
+test("connect stores Herdr's raw terminal_id, not the pane or picker name", async () => {
+  const stored: Pairing[] = [];
+  const agent: AgentInfo = {
+    ref: { target: "pane-id", pid: null, processStartedAt: null },
+    backend: "herdr",
+    agent: "claude",
+    sessionId: null,
+    cwd: "/tmp/project",
+    evidence: { kind: "classified", status: "idle" },
+    terminalTitle: null,
+    terminalId: "herdr-terminal-id",
+    displayId: "picker-name",
+  };
+  const terminals = {
+    async get(target: string) {
+      assert.equal(target, "pane-id");
+      return agent;
+    },
+  } as unknown as Terminals;
+  const pairingStore = {
+    byPane() {
+      return undefined;
+    },
+    add(pairing: Pairing) {
+      stored.push(pairing);
+    },
+  } as unknown as PairingStore;
+  const replies: string[] = [];
+  const notifier = {
+    async postReply(_channel: string, _threadTs: string, text: string) {
+      replies.push(text);
+    },
+  } as unknown as Notifier;
+  const handler = new CommandHandler(terminals, pairingStore, {} as TurnEngine, notifier, OWNER);
+
+  await handler.handlePairSelect({
+    channel: "C1",
+    threadTs: "1.1",
+    userId: OWNER,
+    terminalId: "pane-id",
+  });
+
+  assert.equal(stored.length, 1);
+  assert.equal(stored[0].paneId, "pane-id");
+  assert.equal(stored[0].terminalId, "herdr-terminal-id");
+});
 
 /** Posts a simulated permission button and reads back its prompt ID as Slack does. */
 async function postedButtonPromptId(): Promise<number> {
@@ -94,7 +143,7 @@ function handlerRecording(
   const notifier = { async postReply() {}, async postMessage() {
     return { async update() {} };
   } } as unknown as Notifier;
-  return new CommandHandler({} as HerdrClient, pairingStore, engine, notifier, OWNER);
+  return new CommandHandler(NO_TERMINALS, pairingStore, engine, notifier, OWNER);
 }
 
 test("somebody other than the owner is named", async () => {
@@ -245,7 +294,7 @@ function logHandler(historyLines: string[]) {
       return historyLines;
     },
   } as unknown as Notifier;
-  const handler = new CommandHandler({} as HerdrClient, pairingStore, engine, notifier, OWNER);
+  const handler = new CommandHandler(NO_TERMINALS, pairingStore, engine, notifier, OWNER);
   return { handler, startTurnCalls, replies };
 }
 
@@ -395,4 +444,89 @@ test("only the Codex variant says mode and plan are unavailable", async () => {
   assert.ok(codex.includes("Codex CLI では利用できません"));
   assert.ok(!claude.includes("Codex CLI では利用できません"));
   assert.ok(!unpaired.includes("Codex CLI では利用できません"));
+});
+
+test("ExpectationLost from Slack answers tells the user to inspect the terminal", async () => {
+  const replies: string[] = [];
+  const notifier = {
+    async postReply(_channel: string, _threadTs: string, text: string) {
+      replies.push(text);
+    },
+  } as unknown as Notifier;
+  const pairingStore = { get: () => BUTTON_PAIRING } as unknown as PairingStore;
+  const makeHandler = (engine: Partial<TurnEngine>): CommandHandler =>
+    new CommandHandler(NO_TERMINALS, pairingStore, engine as TurnEngine, notifier, OWNER);
+  const lost = new ExpectationLost("prompt changed");
+  const message = "画面が変わったため、回答を途中で止めました。端末で確かめてください";
+
+  await makeHandler({
+    async answerQuestionButton() {
+      throw lost;
+    },
+  }).handleAskUserQuestionButton({
+    channel: "C1",
+    threadTs: "1.1",
+    terminalId: BUTTON_PAIRING.paneId,
+    promptId: 1,
+    optionIndex: 0,
+  });
+  assert.deepEqual(replies.splice(0), [message]);
+
+  await makeHandler({
+    async answerQuestionMultiSelect() {
+      throw lost;
+    },
+  }).handleAskUserQuestionMultiSelect({
+    channel: "C1",
+    threadTs: "1.1",
+    terminalId: BUTTON_PAIRING.paneId,
+    promptId: 1,
+    optionIndices: [0],
+  });
+  assert.deepEqual(replies.splice(0), [message]);
+
+  await makeHandler({
+    async answerPermissionButton() {
+      throw lost;
+    },
+  }).handlePermissionButton({
+    channel: "C1",
+    threadTs: "1.1",
+    terminalId: BUTTON_PAIRING.paneId,
+    promptId: 1,
+    num: "1",
+  });
+  assert.deepEqual(replies.splice(0), [message]);
+
+  await makeHandler({
+    async answerQuestionFreeText() {
+      throw lost;
+    },
+  }).handleFreeTextMessage({ channel: "C1", threadTs: "1.1", text: "answer" });
+  assert.deepEqual(replies.splice(0), [message]);
+
+  await makeHandler({
+    async answerQuestionFreeText() {
+      return { ok: false, reason: "not-pending" };
+    },
+    async answerPlanFeedback() {
+      throw lost;
+    },
+  }).handleFreeTextMessage({ channel: "C1", threadTs: "1.1", text: "feedback" });
+  assert.deepEqual(replies.splice(0), [message]);
+
+  await assert.rejects(
+    makeHandler({
+      async answerPermissionButton() {
+        throw new Error("unexpected");
+      },
+    }).handlePermissionButton({
+      channel: "C1",
+      threadTs: "1.1",
+      terminalId: BUTTON_PAIRING.paneId,
+      promptId: 1,
+      num: "1",
+    }),
+    /unexpected/,
+  );
 });

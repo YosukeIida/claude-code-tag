@@ -1,4 +1,4 @@
-import type { HerdrClient } from "./herdr/client.js";
+import type { Terminals } from "./backend/index.js";
 import type { Pairing, PairingStore } from "./pairing.js";
 import type { TurnEngine } from "./turn.js";
 import type { Notifier } from "./notifier.js";
@@ -6,7 +6,7 @@ import { snapshotOutbox, WrittenFileTracker, type DirSnapshot } from "./attachme
 import { postSegmented } from "./slack/post.js";
 import { readNewRecords, transcriptCreatedAfter, transcriptSizeSafe } from "./agents/transcript.js";
 import { driverFor } from "./agents/driver.js";
-import { SettleTracker } from "./settle.js";
+import { classifiedStatus, SettleTracker } from "./settle.js";
 import { chunkForSlack, markdownToMrkdwn } from "./slack/mrkdwn.js";
 
 function sleep(ms: number): Promise<void> {
@@ -89,7 +89,7 @@ export class BackgroundWatcher {
   private running = false;
 
   constructor(
-    private readonly herdr: HerdrClient,
+    private readonly terminals: Terminals,
     private readonly pairingStore: PairingStore,
     private readonly turnEngine: TurnEngine,
     private readonly notifier: Notifier,
@@ -162,12 +162,10 @@ export class BackgroundWatcher {
   }
 
   private async checkPairing(pairing: Pairing, forceRebaseline: boolean): Promise<void> {
-    // Pairings written before cctag addressed panes by pane_id have no paneId at
-    // all, so every herdr call for them resolves nothing and the thread has been
+    // Pairings written before cctag addressed targets by paneId have no target
+    // at all, so every backend call resolves nothing and the thread has been
     // inert since the upgrade. Same outcome as a closed terminal — unpair and
-    // say so — but diagnosed separately, because "the terminal was closed" is
-    // both wrong and unactionable here, and because it keeps the reason out of
-    // the log line as a literal `undefined`.
+    // report it separately, because "the terminal was closed" is inaccurate.
     if (!pairing.paneId) {
       this.pairingStore.remove(pairing.key);
       console.log(`[watcher] pairing ${pairing.key} predates pane-id addressing — unpaired`);
@@ -182,15 +180,13 @@ export class BackgroundWatcher {
       return;
     }
 
-    const agent = await this.herdr.agentGet(pairing.paneId);
+    const agent = await this.terminals.get(pairing.paneId);
     if (!agent) {
       // "No agent" is not "no pane". Quitting the CLI to restart it in the same
-      // pane leaves that pane at a shell prompt, and agent get then answers
-      // agent_not_found — so unpairing on that alone tore down a pairing during
-      // the very restart pane-id addressing exists to survive (pairing.ts).
-      // Verified on a live pane: agent get failed while pane get still returned
-      // it. A throw propagates, since a herdr timeout is not a missing pane.
-      if (await this.herdr.paneExists(pairing.paneId)) {
+      // pane leaves a shell prompt: Herdr's get returns null while exists still
+      // returns true. A thrown Herdr error propagates, since a timeout is not a
+      // missing pane.
+      if (await this.terminals.exists(pairing.paneId)) {
         // Waited on, but not indefinitely. The grace period is what makes a
         // restart survivable; letting it run forever is what left threads
         // paired to panes whose agent was exited hours earlier.
@@ -219,10 +215,9 @@ export class BackgroundWatcher {
       // discover it was to send a message and get startTurn's agent-not-found.
       // Reported once, from the same place that would have found the work.
       //
-      // `null` specifically, never a thrown error: agentGet() returns null only
-      // for herdr's own no-such-pane answer, and a herdr timeout must not be
-      // reported as a closed terminal (tick() logs those). Same distinction the
-      // poll loop makes.
+      // `null` specifically, never a thrown error: Herdr's get returns null only
+      // for its no-such-pane answer, and a timeout must not be reported as a
+      // closed terminal (tick() logs those). Same distinction the poll loop makes.
       //
       // The pairing is dropped rather than kept, matching what a message to a
       // dead pane already does (commands.ts) — and a paneId is only unique
@@ -299,7 +294,7 @@ export class BackgroundWatcher {
         // both safe and the only way that turn reaches Slack.
         offset: tPath && !transcriptAppeared ? transcriptSizeSafe(tPath) : 0,
         startedAt: Date.now(),
-        lastStatus: agent.agentStatus,
+        lastStatus: classifiedStatus(agent.evidence),
         collected: [],
         outboxBaseline: snapshotOutbox(agent.cwd),
         writes: new WrittenFileTracker(),
@@ -325,7 +320,7 @@ export class BackgroundWatcher {
     // that will never clear (settle.ts). A pane stuck that way never reached
     // the settle check below, so terminal-side output was collected here and
     // then never posted.
-    const status = state.settle.effectiveStatus(agent.agentStatus);
+    const status = state.settle.effectiveStatus(classifiedStatus(agent.evidence));
 
     if (status === "blocked") {
       // The watch is dropped only if the engine actually took the handoff. It
@@ -339,7 +334,9 @@ export class BackgroundWatcher {
         transcriptPath: state.transcriptPath,
         offset: state.offset,
         collected: state.collected,
-        paneId: agent.paneId,
+        backend: agent.backend,
+        paneId: agent.ref.target,
+        ref: agent.ref,
         cwd: agent.cwd,
         outboxBaseline: state.outboxBaseline,
         writes: state.writes,

@@ -1,13 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { TurnEngine } from "./turn.js";
-import type { HerdrClient } from "./herdr/client.js";
-import type { MessageHandle, Notifier } from "./notifier.js";
+import { HerdrBackend } from "./backend/herdr.js";
+import type { AnswerChannel, Terminals } from "./backend/index.js";
+import { ExpectationLost, type AgentInfo, type AgentStatus } from "./backend/types.js";
 import type { Pairing } from "./pairing.js";
-import type { AgentInfo } from "./herdr/types.js";
+import type { MessageHandle, Notifier } from "./notifier.js";
 import { claudeDriver } from "./agents/claude/driver.js";
 import { WrittenFileTracker } from "./attachments.js";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -27,16 +28,17 @@ function permissionPane(command: string, cursorOn = 1): string {
 
 const PERMISSION_PANE = permissionPane("rm -rf build/");
 
-function fakeAgent(agentStatus: AgentInfo["agentStatus"]): AgentInfo {
+function fakeAgent(status: AgentStatus): AgentInfo {
   return {
+    ref: { target: PANE, pid: null, processStartedAt: null },
+    backend: "herdr",
     agent: "claude",
     sessionId: "s1",
-    agentStatus,
     cwd: "/tmp/nonexistent-cctag-test",
+    evidence: { kind: "classified", status },
+    terminalId: "herdr-terminal-id",
     terminalTitle: null,
-    paneId: PANE,
-    terminalId: "term_test",
-    workspaceId: "wT",
+    displayId: PANE,
   };
 }
 
@@ -111,22 +113,78 @@ function promptIdFromPostedBlocks(postedBlocks: unknown[][]): number {
   throw new Error("no prompt button was posted");
 }
 
-function fakeHerdr(
-  status: () => AgentInfo["agentStatus"],
-  pane: () => string = () => PERMISSION_PANE,
-): HerdrClient {
+type FakeBackend = Terminals;
+
+function fakeAnswerChannel(overrides: Partial<AnswerChannel> = {}): AnswerChannel {
   return {
-    async agentGet() {
-      return fakeAgent(status());
+    async digit(n, terminal) {
+      await overrides.digit?.(n, terminal);
     },
-    async paneRead() {
-      return pane();
+    async text(value) {
+      await overrides.text?.(value);
     },
-    async agentSend() {},
-  } as unknown as HerdrClient;
+    async move(direction, count) {
+      await overrides.move?.(direction, count);
+    },
+    async confirm(expectedLabel, terminal) {
+      await overrides.confirm?.(expectedLabel, terminal);
+    },
+    complete() {
+      overrides.complete?.();
+    },
+  };
 }
 
-function engineFor(herdr: HerdrClient, notifier: Notifier, turnTimeoutMs: number): TurnEngine {
+function fakeBackend(
+  status: () => AgentStatus,
+  pane: () => string = () => PERMISSION_PANE,
+  overrides: Partial<FakeBackend> = {},
+): FakeBackend {
+  return {
+    async list() {
+      return {
+        agents: [],
+        failures: [{ backend: "herdr", reason: "not implemented by test fake" }],
+        complete: false,
+        notices: [],
+      };
+    },
+    async get() {
+      return fakeAgent(status());
+    },
+    async exists() {
+      return true;
+    },
+    async read() {
+      return { text: pane(), draft: null, complete: true };
+    },
+    async submit() {
+      return "accepted";
+    },
+    openAnswer() {
+      return fakeAnswerChannel();
+    },
+    openModelAnswer() {
+      return {
+        ...fakeAnswerChannel(),
+        async escape() {},
+      };
+    },
+    openBlind() {
+      return { async answer() {} };
+    },
+    openComposer() {
+      return { async backTab() {} };
+    },
+    ...overrides,
+  };
+}
+
+function fakeHerdr(status: () => AgentStatus, pane: () => string = () => PERMISSION_PANE): FakeBackend {
+  return fakeBackend(status, pane);
+}
+
+function engineFor(herdr: FakeBackend, notifier: Notifier, turnTimeoutMs: number): TurnEngine {
   return new TurnEngine(
     herdr,
     notifier,
@@ -137,12 +195,14 @@ function engineFor(herdr: HerdrClient, notifier: Notifier, turnTimeoutMs: number
 
 function adopt(engine: TurnEngine, pairing: Pairing): Promise<boolean> {
   return engine.adoptBlockedTerminal(pairing, {
+    backend: "herdr",
     driver: claudeDriver,
     sessionId: "s1",
     transcriptPath: "",
     offset: 0,
     collected: [],
     paneId: PANE,
+    ref: fakeAgent("blocked").ref,
     cwd: "/tmp/nonexistent-cctag-test",
     outboxBaseline: {},
     writes: new WrittenFileTracker(),
@@ -270,24 +330,20 @@ test("moving the cursor within the same prompt is not mistaken for a new one", a
 });
 
 test("a transient herdr failure does not end a live turn", async () => {
-  // Codex review, Critical 5. agentGet() returns null only for herdr's own "no
+  // Codex review, Critical 5. Herdr's `Terminals.get()` returns null only for its own "no
   // such pane"; a timeout or spawn failure throws. Treating the two alike killed
   // turns whose agent was still working, and released the pane to a watcher that
   // rebaselines — losing the rest of the output. Uses a `working` pane so the
   // loop keeps its fast interval and the failures actually get reached.
   const { notifier, posts } = fakeNotifier();
   let calls = 0;
-  const herdr = {
-    async agentGet() {
+  const herdr = fakeBackend(() => "working", () => PERMISSION_PANE, {
+    async get() {
       calls += 1;
       if (calls === 2 || calls === 3) throw new Error("herdr command timed out");
       return fakeAgent("working");
     },
-    async paneRead() {
-      return PERMISSION_PANE;
-    },
-    async agentSend() {},
-  } as unknown as HerdrClient;
+  });
   const engine = engineFor(herdr, notifier, 600_000);
 
   try {
@@ -308,15 +364,11 @@ test("a transient herdr failure does not end a live turn", async () => {
 
 test("herdr failing persistently does eventually end the turn, with its own message", async () => {
   const { notifier, posts } = fakeNotifier();
-  const herdr = {
-    async agentGet(): Promise<AgentInfo | null> {
+  const herdr = fakeBackend(() => "blocked", () => PERMISSION_PANE, {
+    async get(): Promise<AgentInfo | null> {
       throw new Error("herdr command timed out");
     },
-    async paneRead() {
-      return PERMISSION_PANE;
-    },
-    async agentSend() {},
-  } as unknown as HerdrClient;
+  });
   const engine = engineFor(herdr, notifier, 600_000);
 
   await adopt(engine, fakePairing());
@@ -359,20 +411,18 @@ test("a prompt answered twice drives the TUI once", async () => {
   // whose second copy can land on whatever menu appeared next and confirm it.
   const { notifier, postedBlocks } = fakeNotifier();
   const sent: string[] = [];
-  const herdr = {
-    async agentGet() {
-      return fakeAgent("blocked");
-    },
-    async paneRead() {
-      return PERMISSION_PANE;
-    },
+  const herdr = fakeBackend(() => "blocked", () => PERMISSION_PANE, {
     // Slow enough that the second click arrives while the first is in
     // flight — the real race, rather than a simulated one.
-    async agentSend(_paneId: string, text: string) {
-      await sleep(40);
-      sent.push(text);
+    openAnswer() {
+      return fakeAnswerChannel({
+        async digit(n) {
+          await sleep(40);
+          sent.push(String(n));
+        },
+      });
     },
-  } as unknown as HerdrClient;
+  });
   const engine = engineFor(herdr, notifier, 600_000);
 
   try {
@@ -398,18 +448,16 @@ test("a failed answer is not left claimed, so it can be retried", async () => {
   // pending rather than wedging the turn with nothing able to answer it.
   const { notifier, postedBlocks } = fakeNotifier();
   let attempts = 0;
-  const herdr = {
-    async agentGet() {
-      return fakeAgent("blocked");
+  const herdr = fakeBackend(() => "blocked", () => PERMISSION_PANE, {
+    openAnswer() {
+      return fakeAnswerChannel({
+        async digit() {
+          attempts += 1;
+          if (attempts === 1) throw new Error("send-text failed");
+        },
+      });
     },
-    async paneRead() {
-      return PERMISSION_PANE;
-    },
-    async agentSend() {
-      attempts += 1;
-      if (attempts === 1) throw new Error("send-text failed");
-    },
-  } as unknown as HerdrClient;
+  });
   const engine = engineFor(herdr, notifier, 600_000);
 
   try {
@@ -437,19 +485,12 @@ test("disconnecting during startTurn's setup abandons it instead of prompting th
   const prompted: string[] = [];
   let releaseDownload: (() => void) | undefined;
   const downloadStarted = new Promise<void>((r) => setTimeout(r, 60));
-  const herdr = {
-    async agentGet() {
-      return fakeAgent("idle");
-    },
-    async paneRead() {
-      return "";
-    },
-    async agentPrompt(_paneId: string, text: string) {
+  const herdr = fakeBackend(() => "idle", () => "", {
+    async submit(_ref, text) {
       prompted.push(text);
+      return "accepted";
     },
-    async agentSend() {},
-    async paneSendKeys() {},
-  } as unknown as HerdrClient;
+  });
   const engine = engineFor(herdr, notifier, 600_000);
 
   // A notifier whose file download blocks, standing in for a slow transfer.
@@ -554,8 +595,9 @@ test("a cancel landing while the prompt is being posted does not leak the pane",
       return { async update() {} };
     },
   };
+  const terminals = fakeHerdr(() => "blocked");
   const engine = new TurnEngine(
-    fakeHerdr(() => "blocked"),
+    terminals,
     slowPost,
     { turnTimeoutMs: 600_000, pollIntervalMs: 5, limits: { maxFileBytes: 1024, maxFileCount: 1 } },
     { list: () => [fakePairing()] },
@@ -587,8 +629,9 @@ test("cancelling does not free the pane while the holder is still driving it", a
       return { async update() {} };
     },
   };
+  const terminals = fakeHerdr(() => "blocked");
   const engine = new TurnEngine(
-    fakeHerdr(() => "blocked"),
+    terminals,
     slowPost,
     { turnTimeoutMs: 600_000, pollIntervalMs: 5, limits: { maxFileBytes: 1024, maxFileCount: 1 } },
     { list: () => [fakePairing()] },
@@ -614,19 +657,12 @@ test("a cancel mid-submit leaves the pane held until the keystrokes stop", async
   // handing the pane to the next caller while this one was still typing into it.
   const { notifier } = fakeNotifier();
   let releasePrompt: (() => void) | undefined;
-  const herdr = {
-    async agentGet() {
-      return fakeAgent("working");
-    },
-    async paneRead() {
-      return ""; // no startup dialog to trip over
-    },
-    async agentPrompt() {
+  const herdr = fakeBackend(() => "working", () => "", {
+    async submit() {
       await new Promise<void>((r) => (releasePrompt = r));
+      return "accepted";
     },
-    async paneSendKeys() {},
-    async agentSend() {},
-  } as unknown as HerdrClient;
+  });
   const engine = engineFor(herdr, notifier, 600_000);
 
   const starting = engine.startTurn(fakePairing(), "U1", "hello").catch(() => {});
@@ -684,21 +720,13 @@ test("a failed pane read does not surrender a prompt already posted to Slack", a
   // re-adopted and posted the same prompt again, discarding the collected output.
   const { notifier, posts } = fakeNotifier();
   let reads = 0;
-  const herdr = {
-    async agentGet() {
-      return fakeAgent("blocked");
-    },
-    // The first reads fail, i.e. before the prompt has been posted and while the
-    // loop is still on its fast interval — the failures have to land somewhere
-    // the test can reach without waiting out the five-second floor a posted
-    // prompt switches to.
-    async paneRead() {
+  const herdr = fakeBackend(() => "blocked", () => PERMISSION_PANE, {
+    async read() {
       reads += 1;
       if (reads <= 2) throw new Error("herdr command timed out");
-      return PERMISSION_PANE;
+      return { text: PERMISSION_PANE, draft: null, complete: true };
     },
-    async agentSend() {},
-  } as unknown as HerdrClient;
+  });
   const engine = engineFor(herdr, notifier, 600_000);
 
   try {
@@ -800,7 +828,7 @@ test("the new status line is the one the poll loop then updates", async () => {
   // the thread, which is the same invisibility in a new place.
   const events: string[] = [];
   const postedBlocks: unknown[][] = [];
-  let status: AgentInfo["agentStatus"] = "blocked";
+  let status: AgentStatus = "blocked";
   const tracking: Notifier = {
     async postReply() {},
     async postMessage(_c, _t, text, blocks) {
@@ -814,12 +842,7 @@ test("the new status line is the one the poll loop then updates", async () => {
       };
     },
   };
-  const engine = new TurnEngine(
-    fakeHerdr(() => status),
-    tracking,
-    { turnTimeoutMs: 600_000, pollIntervalMs: 5, limits: { maxFileBytes: 1024, maxFileCount: 1 } },
-    { list: () => [fakePairing()] },
-  );
+  const engine = engineFor(fakeHerdr(() => status), tracking, 600_000);
 
   try {
     await adopt(engine, fakePairing());
@@ -865,12 +888,7 @@ test("an answer records who pressed it when that was not the owner", async () =>
       };
     },
   };
-  const engine = new TurnEngine(
-    fakeHerdr(() => "blocked"),
-    recording,
-    { turnTimeoutMs: 600_000, pollIntervalMs: 5, limits: { maxFileBytes: 1024, maxFileCount: 1 } },
-    { list: () => [fakePairing()] },
-  );
+  const engine = engineFor(fakeHerdr(() => "blocked"), recording, 600_000);
 
   try {
     await adopt(engine, fakePairing());
@@ -902,12 +920,7 @@ test("the owner's own answer is left unmarked", async () => {
       };
     },
   };
-  const engine = new TurnEngine(
-    fakeHerdr(() => "blocked"),
-    recording,
-    { turnTimeoutMs: 600_000, pollIntervalMs: 5, limits: { maxFileBytes: 1024, maxFileCount: 1 } },
-    { list: () => [fakePairing()] },
-  );
+  const engine = engineFor(fakeHerdr(() => "blocked"), recording, 600_000);
 
   try {
     await adopt(engine, fakePairing());
@@ -1062,23 +1075,91 @@ function recordingNotifier(): {
   return { notifier, posts, updates, postedBlocks };
 }
 
-function multiSelectHerdr(pane: () => string): { herdr: HerdrClient; sent: string[] } {
-  const sent: string[] = [];
-  const herdr = {
-    async agentGet() {
-      return fakeAgent("blocked");
+const MULTI_SELECT_REVIEW = [
+  "←  ☒ 削る場所  ✔ Submit  →",
+  "",
+  "Review your answers",
+  "",
+  "Ready to submit your answers?",
+  "",
+  "❯ 1. Submit answers",
+].join("\n");
+
+interface FakeHerdrAnswerCli {
+  bin: string;
+  calls(): string[][];
+  pane(): string;
+  setPane(text: string): void;
+  cleanup(): void;
+}
+
+function fakeHerdrAnswerCli(
+  initialPane: string,
+  reviewPane = MULTI_SELECT_REVIEW,
+  failReviewDigit = false,
+): FakeHerdrAnswerCli {
+  const dir = mkdtempSync(join(tmpdir(), "cctag-turn-herdr-"));
+  const bin = join(dir, "herdr-test");
+  const callsFile = join(dir, "calls.jsonl");
+  const paneFile = join(dir, "pane.txt");
+  const script = `#!${process.execPath}
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(callsFile)}, JSON.stringify(args) + "\\n");
+if (args[0] === "pane" && args[1] === "send-keys" && args.includes("Enter")) {
+  fs.writeFileSync(${JSON.stringify(paneFile)}, ${JSON.stringify(reviewPane)});
+}
+if (
+  ${JSON.stringify(failReviewDigit)} &&
+  args[0] === "pane" &&
+  args[1] === "send-text" &&
+  args[3] === "1" &&
+  fs.readFileSync(${JSON.stringify(paneFile)}, "utf8").includes("Review your answers")
+) {
+  process.exit(1);
+}
+if (args[0] === "pane" && args[1] === "read") {
+  process.stdout.write(fs.readFileSync(${JSON.stringify(paneFile)}, "utf8"));
+}
+`;
+  writeFileSync(bin, script);
+  writeFileSync(paneFile, initialPane);
+  chmodSync(bin, 0o755);
+  return {
+    bin,
+    calls() {
+      try {
+        const text = readFileSync(callsFile, "utf8").trim();
+        return text ? text.split("\n").map((line) => JSON.parse(line) as string[]) : [];
+      } catch {
+        return [];
+      }
     },
-    async paneRead() {
-      return pane();
+    pane() {
+      return readFileSync(paneFile, "utf8");
     },
-    async agentSend(_p: string, text: string) {
-      sent.push(`text:${text}`);
+    setPane(text) {
+      writeFileSync(paneFile, text);
     },
-    async paneSendKeys(_p: string, ...keys: string[]) {
-      sent.push(...keys.map((k) => `key:${k}`));
+    cleanup() {
+      rmSync(dir, { recursive: true, force: true });
     },
-  } as unknown as HerdrClient;
-  return { herdr, sent };
+  };
+}
+
+function multiSelectHerdr(
+  pane: () => string,
+  reviewPane = MULTI_SELECT_REVIEW,
+  failReviewDigit = false,
+): { herdr: FakeBackend; cli: FakeHerdrAnswerCli } {
+  const cli = fakeHerdrAnswerCli(pane(), reviewPane, failReviewDigit);
+  const backend = new HerdrBackend(cli.bin);
+  const herdr = fakeBackend(() => "blocked", () => cli.pane(), {
+    openAnswer(ref, prompt) {
+      return backend.openAnswer(ref, prompt);
+    },
+  });
+  return { herdr, cli };
 }
 
 
@@ -1098,36 +1179,116 @@ async function adoptAndAwaitPrompt(engine: TurnEngine, pairing: Pairing = fakePa
  *  that a *different* prompt replaced it cannot be observed sooner. */
 const BLOCKED_POLL_FLOOR_MS = 5_600;
 
-test("a multi-select question can be answered from Slack", async () => {
+test("a multi-select answer confirms a review without requiring a Cancel row", async () => {
   // Until 2026-08-31 it could not: the blocks carried no interactive element, so
   // the only way to answer was at the keyboard. Reported from a four-question
   // dialog where question 1 was answered from Slack and question 2 — the
   // multi-select one — was not.
   const { notifier, updates, postedBlocks } = recordingNotifier();
-  const { herdr, sent } = multiSelectHerdr(() => multiSelectPane("どこから捻出しますか？"));
+  const { herdr, cli } = multiSelectHerdr(() => multiSelectPane("どこから捻出しますか？"));
   const engine = engineFor(herdr, notifier, 600_000);
   try {
     await adoptAndAwaitPrompt(engine);
     const promptId = promptIdFromPostedBlocks(postedBlocks);
     const result = await engine.answerQuestionMultiSelect(PANE, promptId, [0, 2], fakePairing().key);
     assert.equal(result.ok, true);
-    // Options 1 and 3 toggled, then options.length + 1 downs onto Submit, then
-    // Enter. The fixture's fourth row is `Type something`, so there are three.
-    assert.deepEqual(sent.slice(0, 2), ["text:1", "text:3"]);
-    assert.equal(sent.filter((k) => k === "key:Down").length, 4);
-    assert.ok(sent.includes("key:Enter"));
+    assert.deepEqual(cli.calls(), [
+      ["pane", "read", PANE, "--source", "recent", "--lines", "200"],
+      ["pane", "send-text", PANE, "1"],
+      ["pane", "send-text", PANE, "3"],
+      ["pane", "send-keys", PANE, "Down", "Down", "Down", "Down"],
+      ["pane", "send-keys", PANE, "Enter"],
+      ["pane", "send-text", PANE, "1"],
+    ]);
     assert.ok(
       updates.some((u) => u.includes("§2.1「橋渡し」を圧縮") && u.includes("§5.3の処理時間の記述を圧縮")),
       "the thread should say which options were chosen",
     );
   } finally {
     engine.abortAll();
+    cli.cleanup();
+  }
+});
+
+test("a non-review transition ends the compound answer on Submit Enter", async () => {
+  const { notifier, updates, postedBlocks } = recordingNotifier();
+  const nextQuestion = multiSelectPane("次の設問です");
+  const { herdr, cli } = multiSelectHerdr(() => multiSelectPane("どこから捻出しますか？"), nextQuestion);
+  const engine = engineFor(herdr, notifier, 600_000);
+  try {
+    await adoptAndAwaitPrompt(engine);
+    const promptId = promptIdFromPostedBlocks(postedBlocks);
+    assert.equal((await engine.answerQuestionMultiSelect(PANE, promptId, [0], fakePairing().key)).ok, true);
+    assert.deepEqual(cli.calls(), [
+      ["pane", "read", PANE, "--source", "recent", "--lines", "200"],
+      ["pane", "send-text", PANE, "1"],
+      ["pane", "send-keys", PANE, "Down", "Down", "Down", "Down"],
+      ["pane", "send-keys", PANE, "Enter"],
+    ]);
+    assert.ok(updates.some((update) => update.includes("§2.1「橋渡し」を圧縮")));
+  } finally {
+    engine.abortAll();
+    cli.cleanup();
+  }
+});
+
+
+test("a changed multi-select prompt gets no writes before the first Herdr check", async () => {
+  const { notifier, postedBlocks, updates } = recordingNotifier();
+  const { herdr, cli } = multiSelectHerdr(() => multiSelectPane("どこから捻出しますか？"));
+  const engine = engineFor(herdr, notifier, 600_000);
+  try {
+    await adoptAndAwaitPrompt(engine);
+    const promptId = promptIdFromPostedBlocks(postedBlocks);
+    cli.setPane(multiSelectPane("別の質問に変わりました"));
+    await assert.rejects(
+      engine.answerQuestionMultiSelect(PANE, promptId, [0], fakePairing().key),
+      ExpectationLost,
+    );
+    assert.equal(
+      updates.some((update) => update.includes("（ターミナル側で回答済み）")),
+      false,
+      "an incomplete answer must not resolve the Slack prompt",
+    );
+  } finally {
+    engine.abortAll();
+    cli.cleanup();
+  }
+});
+
+test("a failed review confirmation leaves the Slack prompt unresolved", async () => {
+  const { notifier, postedBlocks, updates } = recordingNotifier();
+  const { herdr, cli } = multiSelectHerdr(
+    () => multiSelectPane("どこから捻出しますか？"),
+    MULTI_SELECT_REVIEW,
+    true,
+  );
+  const engine = engineFor(herdr, notifier, 600_000);
+  try {
+    await adoptAndAwaitPrompt(engine);
+    const promptId = promptIdFromPostedBlocks(postedBlocks);
+    await assert.rejects(engine.answerQuestionMultiSelect(PANE, promptId, [0], fakePairing().key));
+    assert.deepEqual(cli.calls(), [
+      ["pane", "read", PANE, "--source", "recent", "--lines", "200"],
+      ["pane", "send-text", PANE, "1"],
+      ["pane", "send-keys", PANE, "Down", "Down", "Down", "Down"],
+      ["pane", "send-keys", PANE, "Enter"],
+      ["pane", "send-text", PANE, "1"],
+    ]);
+    assert.equal(
+      updates.some((update) => update.includes("（ターミナル側で回答済み）")),
+      false,
+      "a failed final write must not resolve the Slack prompt",
+    );
+  } finally {
+    engine.abortAll();
+    cli.cleanup();
   }
 });
 
 test("a stale submit for an already-answered question is refused", async () => {
   const { notifier, postedBlocks } = recordingNotifier();
-  const { herdr } = multiSelectHerdr(() => multiSelectPane("どこから捻出しますか？"));
+  const { herdr, cli } = multiSelectHerdr(() => multiSelectPane("どこから捻出しますか？"));
   const engine = engineFor(herdr, notifier, 600_000);
   try {
     await adoptAndAwaitPrompt(engine);
@@ -1138,12 +1299,13 @@ test("a stale submit for an already-answered question is refused", async () => {
     assert.equal(again.ok, false, "the prompt id is spent");
   } finally {
     engine.abortAll();
+    cli.cleanup();
   }
 });
 
 test("indices outside the option list never reach the pane as keystrokes", async () => {
   const { notifier, postedBlocks } = recordingNotifier();
-  const { herdr, sent } = multiSelectHerdr(() => multiSelectPane("どこから捻出しますか？"));
+  const { herdr, cli } = multiSelectHerdr(() => multiSelectPane("どこから捻出しますか？"));
   const engine = engineFor(herdr, notifier, 600_000);
   try {
     await adoptAndAwaitPrompt(engine);
@@ -1151,12 +1313,11 @@ test("indices outside the option list never reach the pane as keystrokes", async
     // 10 would be typed into the dialog as a keystroke meaning nothing — or, on
     // a dialog with ten rows, as the wrong one.
     await engine.answerQuestionMultiSelect(PANE, promptId, [0, 9], fakePairing().key);
-    assert.deepEqual(
-      sent.filter((k) => k.startsWith("text:")),
-      ["text:1"],
-    );
+    const textWrites = cli.calls().filter((args) => args[1] === "send-text").map((args) => args[3]);
+    assert.deepEqual(textWrites, ["1", "1"], "valid choice and review confirm only");
   } finally {
     engine.abortAll();
+    cli.cleanup();
   }
 });
 
@@ -1167,13 +1328,14 @@ test("answering at the keyboard keeps the question in the thread", async () => {
   // the question nor its options.
   const { notifier, updates } = recordingNotifier();
   let question = "どこから捻出しますか？";
-  const { herdr } = multiSelectHerdr(() => multiSelectPane(question));
+  const { herdr, cli } = multiSelectHerdr(() => multiSelectPane(question));
   const engine = engineFor(herdr, notifier, 600_000);
   try {
     await adoptAndAwaitPrompt(engine);
     // A *different* question now showing, with the pane never leaving `blocked`,
     // is how the poll loop learns the pending one was answered at the terminal.
     question = "見直し範囲はどうしますか？";
+    cli.setPane(multiSelectPane(question));
     await sleep(BLOCKED_POLL_FLOOR_MS);
 
     const note = updates.find((u) => u.includes("（ターミナル側で回答済み）"));
@@ -1182,6 +1344,7 @@ test("answering at the keyboard keeps the question in the thread", async () => {
     assert.ok(note.includes("§2.1「橋渡し」を圧縮"), "so must the options");
   } finally {
     engine.abortAll();
+    cli.cleanup();
   }
 });
 
@@ -1190,33 +1353,49 @@ test("a reply of just option numbers ticks those boxes instead of being typed as
   // read "1,3" as a selection — the free-text row records it verbatim — so
   // without this the agent received the string "1,3" and had to guess.
   const { notifier, updates } = recordingNotifier();
-  const { herdr, sent } = multiSelectHerdr(() => multiSelectPane("どこから捻出しますか？"));
+  const { herdr, cli } = multiSelectHerdr(() => multiSelectPane("どこから捻出しますか？"));
   const engine = engineFor(herdr, notifier, 600_000);
   try {
     await adoptAndAwaitPrompt(engine);
     assert.equal((await engine.answerQuestionFreeText(PANE, "1,3")).ok, true);
-    assert.deepEqual(sent.slice(0, 2), ["text:1", "text:3"], "toggled, not typed");
+    assert.deepEqual(cli.calls(), [
+      ["pane", "read", PANE, "--source", "recent", "--lines", "200"],
+      ["pane", "send-text", PANE, "1"],
+      ["pane", "send-text", PANE, "3"],
+      ["pane", "send-keys", PANE, "Down", "Down", "Down", "Down"],
+      ["pane", "send-keys", PANE, "Enter"],
+      ["pane", "send-text", PANE, "1"],
+    ]);
     assert.ok(
       updates.some((u) => u.includes("§2.1「橋渡し」を圧縮") && u.includes("§5.3の処理時間の記述を圧縮")),
       "the thread should name the options, not echo the digits",
     );
   } finally {
     engine.abortAll();
+    cli.cleanup();
   }
 });
 
 test("a reply that is not just option numbers is still passed through as text", async () => {
   const { notifier } = recordingNotifier();
-  const { herdr, sent } = multiSelectHerdr(() => multiSelectPane("どこから捻出しますか？"));
+  const { herdr, cli } = multiSelectHerdr(() => multiSelectPane("どこから捻出しますか？"));
   const engine = engineFor(herdr, notifier, 600_000);
   try {
     await adoptAndAwaitPrompt(engine);
     // Out of range, so it cannot be a selection — and a duplicate would toggle
     // the same box off again, which is worse than passing the text along.
     assert.equal((await engine.answerQuestionFreeText(PANE, "1,9")).ok, true);
-    assert.ok(sent.includes("text:1,9"), `expected the text verbatim, got ${JSON.stringify(sent)}`);
+    assert.deepEqual(cli.calls(), [
+      ["pane", "read", PANE, "--source", "recent", "--lines", "200"],
+      ["pane", "send-keys", PANE, "Down", "Down", "Down"],
+      ["pane", "send-text", PANE, "1,9"],
+      ["pane", "send-keys", PANE, "Down"],
+      ["pane", "send-keys", PANE, "Enter"],
+      ["pane", "send-text", PANE, "1"],
+    ]);
   } finally {
     engine.abortAll();
+    cli.cleanup();
   }
 });
 
@@ -1254,20 +1433,18 @@ test("a button from the previous turn cannot answer the next same-kind prompt", 
 
   const nextButton = fakeNotifier();
   const writes: string[] = [];
-  const herdr = {
-    async agentGet() {
-      return fakeAgent("blocked");
+  const herdr = fakeBackend(() => "blocked", () => PERMISSION_PANE, {
+    openAnswer() {
+      return fakeAnswerChannel({
+        async digit(n) {
+          writes.push(`text:${n}`);
+        },
+        async confirm() {
+          writes.push("key:Enter");
+        },
+      });
     },
-    async paneRead() {
-      return PERMISSION_PANE;
-    },
-    async agentSend(_paneId: string, text: string) {
-      writes.push(`text:${text}`);
-    },
-    async paneSendKeys(_paneId: string, ...keys: string[]) {
-      writes.push(...keys.map((key) => `key:${key}`));
-    },
-  } as unknown as HerdrClient;
+  });
   const currentTurn = engineFor(herdr, nextButton.notifier, 600_000);
   try {
     await adoptAndAwaitPrompt(currentTurn, pairing);
@@ -1286,20 +1463,18 @@ test("a button from the previous turn cannot answer the next same-kind prompt", 
 test("a matching prompt ID from another pairing is rejected without writing keys", async () => {
   const { notifier, postedBlocks } = fakeNotifier();
   const writes: string[] = [];
-  const herdr = {
-    async agentGet() {
-      return fakeAgent("blocked");
+  const herdr = fakeBackend(() => "blocked", () => PERMISSION_PANE, {
+    openAnswer() {
+      return fakeAnswerChannel({
+        async digit(n) {
+          writes.push(`text:${n}`);
+        },
+        async confirm() {
+          writes.push("key:Enter");
+        },
+      });
     },
-    async paneRead() {
-      return PERMISSION_PANE;
-    },
-    async agentSend(_paneId: string, text: string) {
-      writes.push(`text:${text}`);
-    },
-    async paneSendKeys(_paneId: string, ...keys: string[]) {
-      writes.push(...keys.map((key) => `key:${key}`));
-    },
-  } as unknown as HerdrClient;
+  });
   const engine = engineFor(herdr, notifier, 600_000);
   try {
     await adoptAndAwaitPrompt(engine);

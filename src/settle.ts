@@ -1,5 +1,9 @@
-import type { AgentStatus } from "./herdr/types.js";
+import type { AgentStatus, StatusEvidence } from "./backend/types.js";
 import type { TurnLifecycleEvent } from "./agents/driver.js";
+
+export function classifiedStatus(evidence: StatusEvidence): AgentStatus {
+  return evidence.kind === "classified" ? evidence.status : "unknown";
+}
 
 /**
  * Whether the agent has finished its turn, decided from the agent's own

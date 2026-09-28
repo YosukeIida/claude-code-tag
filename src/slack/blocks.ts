@@ -1,4 +1,5 @@
-import type { AgentInfo } from "../herdr/types.js";
+import type { AgentInfo, BackendName, ListResult } from "../backend/types.js";
+import { classifiedStatus } from "../settle.js";
 import type { AskUserQuestionPaneInfo, PermissionMenu } from "../agents/driver.js";
 import { isDangerousSnippet, isRefusalLabel } from "../agents/driver.js";
 import type { MarkdownTable } from "./mrkdwn.js";
@@ -22,33 +23,38 @@ function dirLabel(cwd: string): string {
 }
 
 /**
- * A static_select of currently running herdr agents, for `@cctag connect`.
+ * A static_select of currently running backend agents, for `@cctag connect`.
  *
- * Grouped by cwd via Slack's native `option_groups`: one header per project
- * directory, one row per session underneath — mirroring the Claude Code
- * app's own session picker (folder name, then each session's title) instead
- * of a flat list of full paths that gave no way to tell two sessions in the
- * same directory apart at a glance. The title itself is `terminalTitle`,
- * herdr's live read of the pane's own tab title — not re-derived from the
- * session transcript, which isn't guaranteed to contain one (verified: a
- * long-running session with a title visible in its tab had zero title
- * records in a 13MB transcript).
+ * Grouped by backend and project directory via Slack's native `option_groups`,
+ * with each row showing the terminal title when available and a backend-provided
+ * display ID otherwise.
  */
-export function agentPickerBlocks(agents: AgentInfo[]) {
+export function agentPickerBlocks(result: ListResult) {
+  const agents = result.agents;
   if (agents.length === 0) {
+    const backends = new Set<BackendName>(["herdr", ...result.failures.map((failure) => failure.backend)]);
+    const details = [
+      ...result.failures.map((failure) => `⚠️ ${failure.backend}: ${failure.reason}`),
+      ...result.notices.map((notice) => `ℹ️ ${notice}`),
+    ];
+    if (!result.complete) details.unshift("⚠️ インスタンス一覧は不完全です。");
     return [
       {
         type: "section",
-        text: { type: "mrkdwn", text: "現在 herdr 上で稼働中のインスタンスが見つかりません。" },
+        text: {
+          type: "mrkdwn",
+          text: [`現在 ${[...backends].join(" / ")} 上で稼働中のインスタンスが見つかりません。`, ...details].join("\n"),
+        },
       },
     ];
   }
 
-  const groups = new Map<string, AgentInfo[]>();
-  for (const a of agents) {
-    const list = groups.get(a.cwd);
-    if (list) list.push(a);
-    else groups.set(a.cwd, [a]);
+  const groups = new Map<string, { backend: BackendName; cwd: string; agents: AgentInfo[] }>();
+  for (const agent of agents) {
+    const key = `${agent.backend}\0${agent.cwd}`;
+    const group = groups.get(key);
+    if (group) group.agents.push(agent);
+    else groups.set(key, { backend: agent.backend, cwd: agent.cwd, agents: [agent] });
   }
 
   return [
@@ -59,31 +65,23 @@ export function agentPickerBlocks(agents: AgentInfo[]) {
         type: "static_select",
         action_id: "pair_select",
         placeholder: { type: "plain_text", text: "インスタンスを選択" },
-        option_groups: [...groups.entries()].map(([cwd, group]) => ({
-          label: { type: "plain_text", text: dirLabel(cwd).slice(0, 75) },
-          options: group.map((a) => {
-            const prefix = a.agent && a.agent !== "claude" ? `[${a.agent}] ` : "";
-            const label = a.terminalTitle ?? a.name ?? a.paneId;
+        option_groups: [...groups.values()].map(({ backend, cwd, agents: group }) => ({
+          label: { type: "plain_text", text: `${backend} · ${dirLabel(cwd)}`.slice(0, 75) },
+          options: group.map((agent) => {
+            const prefix = agent.agent !== "claude" ? `[${agent.agent}] ` : "";
+            const label = agent.terminalTitle ?? agent.displayId;
             return {
               text: {
                 type: "plain_text",
-                text: `${STATUS_ICON[a.agentStatus] ?? "⚪"} ${prefix}${label}`.slice(0, 75),
+                text: `${STATUS_ICON[classifiedStatus(agent.evidence)] ?? "⚪"} ${prefix}${label}`.slice(0, 75),
               },
-              value: a.paneId,
+              value: agent.ref.target,
             };
           }),
         })),
       },
     },
   ];
-}
-
-export function statusText(agent: AgentInfo | null, elapsedSec?: number, lastTool?: string): string {
-  if (!agent) return "⚠️ インスタンスが見つかりません";
-  if (agent.agentStatus === "blocked") return "⏸ 応答待ち…";
-  const suffix = lastTool ? ` — 🔧 ${lastTool}` : "";
-  const time = elapsedSec !== undefined ? ` (${elapsedSec}s)` : "";
-  return `⚙️ 実行中…${time}${suffix}`;
 }
 
 export function doneStatusText(elapsedSec: number, toolCounts: Record<string, number>): string {
@@ -94,7 +92,7 @@ export function doneStatusText(elapsedSec: number, toolCounts: Record<string, nu
 
 interface AqButtonValue {
   k: "aq";
-  t: string; // paneId (herdr agent-command target — see pairing.ts)
+  t: string; // backend target, stored in Pairing.paneId for compatibility
   p: number; // process-unique prompt ID (stale-button guard)
   o: number; // option index
 }

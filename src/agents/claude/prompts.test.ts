@@ -7,6 +7,11 @@ import {
   previewAnchorIndex,
 } from "./prompts.js";
 import { claudeDriver } from "./driver.js";
+import type { AnswerChannel, Terminals } from "../../backend/index.js";
+import type { AgentRef } from "../../backend/types.js";
+import { ExpectationLost } from "../../backend/types.js";
+
+const TEST_REF: AgentRef = { target: "w0:p1", pid: null, processStartedAt: null };
 
 // Fixtures taken from a real pane. A two-question AskUserQuestion was raised on
 // purpose — one question with option previews, one without — because that shape
@@ -167,23 +172,64 @@ test("a permission menu is not mistaken for a preview question", () => {
 // --- answering, which differs by renderer -------------------------------------
 
 /** Records what was sent, and lets the test decide what the pane shows next. */
-function fakeHerdr(paneAfterDigit: () => string): {
-  herdr: Parameters<NonNullable<typeof claudeDriver.answerQuestionOption>>[0];
-  sent: string[];
-} {
+function fakeHerdr(
+  paneAfterDigit: () => string,
+  readPane: () => string | Promise<string> = paneAfterDigit,
+  initialPrompt = PREVIEW_PANE,
+): { herdr: Terminals; channel: AnswerChannel; sent: string[] } {
   const sent: string[] = [];
-  const herdr = {
-    async agentSend(_p: string, text: string) {
-      sent.push(`text:${text}`);
+  const channel: AnswerChannel = {
+    async digit(n) {
+      sent.push(`text:${n}`);
     },
-    async paneSendKeys(_p: string, ...keys: string[]) {
-      sent.push(...keys.map((k) => `key:${k}`));
+    async text(value) {
+      sent.push(`text:${value}`);
     },
-    async paneRead() {
-      return paneAfterDigit();
+    async move(direction, count) {
+      sent.push(...Array(count).fill(`key:${direction}`));
     },
-  } as unknown as Parameters<NonNullable<typeof claudeDriver.answerQuestionOption>>[0];
-  return { herdr, sent };
+    async confirm() {
+      sent.push("key:Enter");
+    },
+    complete() {},
+  };
+  const herdr: Terminals = {
+    async list() {
+      return { agents: [], failures: [], complete: true, notices: [] };
+    },
+    async get() {
+      return null;
+    },
+    async exists() {
+      return true;
+    },
+    async read() {
+      return { text: await readPane(), draft: null, complete: true };
+    },
+    async submit() {
+      return "accepted";
+    },
+    openAnswer() {
+      return channel;
+    },
+    openModelAnswer() {
+      return {
+        ...channel,
+        async escape() {
+          sent.push("key:Escape");
+        },
+      };
+    },
+    openBlind() {
+      return { async answer() {} };
+    },
+    openComposer() {
+      return { async backTab() {} };
+    },
+  };
+  const prompt = claudeDriver.parseBlockedPane(initialPrompt);
+  if (prompt.kind !== "question") throw new Error(`expected question fixture, got ${prompt.kind}`);
+  return { herdr, channel: herdr.openAnswer(TEST_REF, prompt.verified), sent };
 }
 
 const PREVIEW_LABELS = [
@@ -200,8 +246,8 @@ const PREVIEW_INFO = {
 test("the preview renderer gets the Enter its digit does not supply", async () => {
   // Measured: in this renderer a digit only moves the cursor. Without the Enter
   // the dialog just sits there with a different option highlighted.
-  const { herdr, sent } = fakeHerdr(() => PREVIEW_PANE);
-  await claudeDriver.answerQuestionOption!(herdr, "w0:p1", 2, PREVIEW_INFO);
+  const { herdr, channel, sent } = fakeHerdr(() => PREVIEW_PANE);
+  await claudeDriver.answerQuestionOption!(herdr, channel, "w0:p1", 2, PREVIEW_INFO);
   assert.deepEqual(sent, ["text:2", "key:Enter"]);
 });
 
@@ -210,15 +256,15 @@ test("the classic renderer gets no Enter, which would answer the next question",
   // advanced by the time we look — so a trailing Enter would confirm whatever is
   // highlighted on the question that replaced it.
   const nextQuestion = ["単位系はどちらにしますか？", "", "❯ 1. SI単位系", "  2. ヤード・ポンド法", "  3. Type something."].join("\n");
-  const { herdr, sent } = fakeHerdr(() => nextQuestion);
-  await claudeDriver.answerQuestionOption!(herdr, "w0:p1", 1, PREVIEW_INFO);
+  const { herdr, channel, sent } = fakeHerdr(() => nextQuestion);
+  await claudeDriver.answerQuestionOption!(herdr, channel, "w0:p1", 1, PREVIEW_INFO);
   assert.deepEqual(sent, ["text:1"], "the digit alone");
 });
 
 test("landing on the submit menu also gets no Enter", async () => {
   const submitMenu = ["Ready to submit your answers?", "❯ 1. Submit answers", "  2. Cancel"].join("\n");
-  const { herdr, sent } = fakeHerdr(() => submitMenu);
-  await claudeDriver.answerQuestionOption!(herdr, "w0:p1", 1, PREVIEW_INFO);
+  const { herdr, channel, sent } = fakeHerdr(() => submitMenu);
+  await claudeDriver.answerQuestionOption!(herdr, channel, "w0:p1", 1, PREVIEW_INFO);
   assert.deepEqual(sent, ["text:1"]);
 });
 
@@ -226,8 +272,8 @@ test("a different preview question on screen gets no Enter either", async () => 
   // Same renderer, but a *different* question means the digit confirmed and
   // advanced; the identity check is what tells those two cases apart.
   const other = PREVIEW_PANE.replace("配色はどちらにしますか？", "フォントはどちらにしますか？");
-  const { herdr, sent } = fakeHerdr(() => other);
-  await claudeDriver.answerQuestionOption!(herdr, "w0:p1", 1, PREVIEW_INFO);
+  const { herdr, channel, sent } = fakeHerdr(() => other);
+  await claudeDriver.answerQuestionOption!(herdr, channel, "w0:p1", 1, PREVIEW_INFO);
   assert.deepEqual(sent, ["text:1"]);
 });
 
@@ -239,8 +285,8 @@ test("a following question that repeats the wording does not inherit the Enter",
     "  2. 明るいティール＆コーラル     │ サブアクセント: #8C7A5B (くすみゴールド)                    │",
     "  2. 全く別の選択肢               │ サブアクセント: #8C7A5B (くすみゴールド)                    │",
   );
-  const { herdr, sent } = fakeHerdr(() => sameWordingDifferentOptions);
-  await claudeDriver.answerQuestionOption!(herdr, "w0:p1", 1, PREVIEW_INFO);
+  const { herdr, channel, sent } = fakeHerdr(() => sameWordingDifferentOptions);
+  await claudeDriver.answerQuestionOption!(herdr, channel, "w0:p1", 1, PREVIEW_INFO);
   assert.deepEqual(sent, ["text:1"], "different options mean a different question");
 });
 
@@ -248,10 +294,10 @@ test("a cancelled pane gets the digit but never the confirming Enter", async () 
   // Codex re-review round 3, Critical 3. This runs outside the poll loop, which
   // releases the pane as soon as it is asked to stop — so by the time the Enter
   // would be sent, something else may hold the pane.
-  const { herdr, sent } = fakeHerdr(() => PREVIEW_PANE);
+  const { herdr, channel, sent } = fakeHerdr(() => PREVIEW_PANE);
   const controller = new AbortController();
   controller.abort();
-  await claudeDriver.answerQuestionOption!(herdr, "w0:p1", 2, PREVIEW_INFO, controller.signal);
+  await claudeDriver.answerQuestionOption!(herdr, channel, "w0:p1", 2, PREVIEW_INFO, controller.signal);
   assert.deepEqual(sent, ["text:2"], "no keystroke may follow the release");
 });
 
@@ -259,15 +305,14 @@ test("a failed re-read is reported, not treated as answered", async () => {
   // Codex re-review round 3, Critical 4. Swallowing it meant no Enter was sent
   // while the caller marked the Slack prompt answered — the pane stayed waiting
   // and the same prompt came back on the next poll.
-  const herdr = {
-    async agentSend() {},
-    async paneSendKeys() {},
-    async paneRead() {
+  const { herdr, channel } = fakeHerdr(
+    () => "",
+    async () => {
       throw new Error("herdr command timed out");
     },
-  } as unknown as Parameters<NonNullable<typeof claudeDriver.answerQuestionOption>>[0];
+  );
   await assert.rejects(
-    claudeDriver.answerQuestionOption!(herdr, "w0:p1", 1, PREVIEW_INFO),
+    claudeDriver.answerQuestionOption!(herdr, channel, "w0:p1", 1, PREVIEW_INFO),
     /herdr command timed out/,
   );
 });
@@ -388,6 +433,7 @@ test("a classic dialog is not hijacked by the preview parser", () => {
   const prompt = claudeDriver.parseBlockedPane(classic);
   assert.equal(prompt.kind, "question");
   if (prompt.kind !== "question") return;
+  assert.equal(prompt.verified.form, "digit-confirms");
   assert.deepEqual(
     prompt.info.options.map((o) => o.label),
     ["数名（関係者のみ）", "20〜30名（1クラス）", "50名以上"],
@@ -401,8 +447,80 @@ test("the preview renderer's own unnumbered chat row still anchors it", () => {
   const prompt = claudeDriver.parseBlockedPane(PREVIEW_PANE);
   assert.equal(prompt.kind, "question");
   if (prompt.kind !== "question") return;
+  assert.equal(prompt.verified.form, "digit-then-enter");
   assert.deepEqual(prompt.info.options.map((o) => o.label), PREVIEW_LABELS);
 });
+
+// Minimal rows, copied verbatim from the live u0 captures named in u2b:
+// terminal.tail rows 97-108 for the question and 94-108 for /model.
+const CAPTURED_QUESTION_BEFORE_DOWN = [
+  " ☐ Test color",
+  "Test color: どの色を選びますか？",
+  "❯ 1. amber",
+  "     琥珀色。温かみのある黄橙系の色",
+  "  2. cobalt",
+  "     コバルトブルー。深く鮮やかな青",
+  "  3. jade",
+  "     翡翠色。落ち着いた青みのある緑",
+  "  4. Type something.",
+  "  5. Chat about this",
+  "Enter to select · ↑/↓ to navigate · Esc to cancel",
+].join("\n");
+const CAPTURED_QUESTION_AFTER_DOWN = [
+  " ☐ Test color",
+  "Test color: どの色を選びますか？",
+  "  1. amber",
+  "     琥珀色。温かみのある黄橙系の色",
+  "❯ 2. cobalt",
+  "     コバルトブルー。深く鮮やかな青",
+  "  3. jade",
+  "     翡翠色。落ち着いた青みのある緑",
+  "  4. Type something.",
+  "  5. Chat about this",
+  "Enter to select · ↑/↓ to navigate · Esc to cancel",
+].join("\n");
+const CAPTURED_MODEL_BEFORE_DOWN = [
+  "   Select model",
+  "   Switch between Claude models. Your pick becomes the default for new sessions. For other/previous model names, specify with --model.",
+  "   ❯ 1.  Default (recommended) ✔  Opus 5.5 · Best for everyday, complex tasks",
+  "     2.  Opus 5.5                 Most capable for ambitious work",
+  "Enter to set as default · s to use this session only · Esc to cancel",
+].join("\n");
+const CAPTURED_MODEL_AFTER_DOWN = [
+  "   Select model",
+  "   Switch between Claude models. Your pick becomes the default for new sessions. For other/previous model names, specify with --model.",
+  "     1.  Default (recommended) ✔  Opus 5.5 · Best for everyday, complex tasks",
+  "   ❯ 2.  Opus 5.5                 Most capable for ambitious work",
+  "Enter to set as default · s to use this session only · Esc to cancel",
+].join("\n");
+
+test("Claude cursor labels follow captured question and /model rows before and after Down", () => {
+  const snapshot = (text: string) => ({ text, draft: null, complete: true });
+  assert.equal(claudeDriver.parseCursorLabel(snapshot(CAPTURED_QUESTION_BEFORE_DOWN)), "amber");
+  assert.equal(claudeDriver.parseCursorLabel(snapshot(CAPTURED_QUESTION_AFTER_DOWN)), "cobalt");
+  assert.equal(
+    claudeDriver.parseCursorLabel(snapshot(CAPTURED_MODEL_BEFORE_DOWN)),
+    "Default (recommended) ✔  Opus 5.5 · Best for everyday, complex tasks",
+  );
+  assert.equal(
+    claudeDriver.parseCursorLabel(snapshot(CAPTURED_MODEL_AFTER_DOWN)),
+    "Opus 5.5                 Most capable for ambitious work",
+  );
+  assert.equal(
+    claudeDriver.parseCursorLabel(snapshot(["────────────────────", "❯", "────────────────────", "   Opus 5.5"].join("\n"))),
+    null,
+    "the idle composer cursor has no selected option label",
+  );
+  assert.equal(claudeDriver.parseCursorLabel(snapshot("Select model\n  1. Opus\n  2. Sonnet")), null);
+});
+
+test("Claude cursor parser leaves an unnumbered Submit row unread", () => {
+  const snapshot = (text: string) => ({ text, draft: null, complete: true });
+  // Synthetic row to pin current behavior only; no selected-Submit live capture
+  // is available to justify parsing its cursor label.
+  assert.equal(claudeDriver.parseCursorLabel(snapshot("❯    Submit")), null);
+});
+
 
 // --- the context snippet's reach, and answering an unreadable screen --------
 
@@ -429,6 +547,7 @@ test("a plan prompt's snippet stops at the rule, not eight lines up", () => {
   const prompt = claudeDriver.parseBlockedPane(pane);
   assert.equal(prompt.kind, "permission");
   if (prompt.kind !== "permission") return;
+  assert.equal(prompt.verified.form, "compound");
   assert.equal(prompt.isPlanPrompt, true);
   const snippet = prompt.menu?.snippet ?? "";
   assert.ok(snippet.startsWith("Claude has written up a plan"), `snippet began with: ${snippet.slice(0, 60)}`);
@@ -453,6 +572,7 @@ test("a permission menu with no rule above it keeps its context", () => {
   const prompt = claudeDriver.parseBlockedPane(pane);
   assert.equal(prompt.kind, "permission");
   if (prompt.kind !== "permission") return;
+  assert.equal(prompt.verified.form, "digit-confirms");
   assert.ok(prompt.menu?.snippet.includes("rm -rf /tmp/scratch-dir"), "the command must survive");
 });
 
@@ -533,6 +653,7 @@ test("a real multi-select dialog is read as a question, not as an unparseable me
   // question 2 did not.
   const prompt = claudeDriver.parseBlockedPane(LIVE_MULTI_SELECT);
   assert.equal(prompt.kind, "question", "a checkbox on the free-text row must not hide the dialog");
+  if (prompt.kind === "question") assert.equal(prompt.verified.form, "compound");
 });
 
 test("the captured dialog's options, question and multiSelect flag all come through", () => {
@@ -584,6 +705,18 @@ const MULTI_INFO = {
   multiSelect: true,
 };
 
+const MULTI_PROMPT = [
+  "☒ テスト",
+  "",
+  "テスト用の質問です",
+  "",
+  "❯ 1. [ ] Alpha",
+  "  2. [ ] Bravo",
+  "  3. [ ] Charlie",
+  "  4. [ ] Delta",
+  "  5. Type something.",
+].join("\n");
+
 const REVIEW_SCREEN = [
   "←  ☒ テスト  ✔ Submit  →",
   "",
@@ -595,12 +728,11 @@ const REVIEW_SCREEN = [
   "Ready to submit your answers?",
   "",
   "❯ 1. Submit answers",
-  "  2. Cancel",
 ].join("\n");
 
-test("a multi-select answer toggles each choice, walks to Submit, then confirms the review", async () => {
-  const { herdr, sent } = fakeHerdr(() => REVIEW_SCREEN);
-  await claudeDriver.answerQuestionMultiSelect!(herdr, "w0:p1", [2, 4], MULTI_INFO);
+test("a multi-select answer confirms a review without requiring a Cancel row", async () => {
+  const { herdr, channel, sent } = fakeHerdr(() => REVIEW_SCREEN, undefined, MULTI_PROMPT);
+  await claudeDriver.answerQuestionMultiSelect!(herdr, channel, TEST_REF, [2, 4], MULTI_INFO);
   assert.deepEqual(sent, [
     "text:2",
     "text:4",
@@ -622,8 +754,8 @@ test("the confirming digit is withheld when the review screen is not the thing o
   const nextQuestion = ["☐ 次の質問", "", "別の質問です", "", "❯ 1. [ ] X", "  2. [ ] Y", "  3. [ ] Type something"].join(
     "\n",
   );
-  const { herdr, sent } = fakeHerdr(() => nextQuestion);
-  await claudeDriver.answerQuestionMultiSelect!(herdr, "w0:p1", [1], MULTI_INFO);
+  const { herdr, channel, sent } = fakeHerdr(() => nextQuestion, undefined, MULTI_PROMPT);
+  await claudeDriver.answerQuestionMultiSelect!(herdr, channel, TEST_REF, [1], MULTI_INFO);
   assert.equal(sent.at(-1), "key:Enter", "stops at the Submit row's Enter");
   assert.ok(!sent.slice(sent.indexOf("key:Enter")).includes("text:1"));
 });
@@ -633,10 +765,12 @@ test("a cancelled pane gets no keystrokes past the point it was cancelled", asyn
   // outside the poll loop, so the pane may already belong to something else.
   const controller = new AbortController();
   controller.abort();
-  const { herdr, sent } = fakeHerdr(() => REVIEW_SCREEN);
-  await claudeDriver.answerQuestionMultiSelect!(herdr, "w0:p1", [2], MULTI_INFO, controller.signal);
-  assert.ok(!sent.includes("key:Enter"), "the submitting Enter must not reach a released pane");
-  assert.ok(!sent.includes("text:1"));
+  const { herdr, channel, sent } = fakeHerdr(() => REVIEW_SCREEN, undefined, MULTI_PROMPT);
+  await assert.rejects(
+    claudeDriver.answerQuestionMultiSelect!(herdr, channel, TEST_REF, [2], MULTI_INFO, controller.signal),
+    ExpectationLost,
+  );
+  assert.deepEqual(sent, [], "an already-cancelled answer must not be reported as completed");
 });
 
 test("free text on a multi-select dialog is submitted, not un-ticked", async () => {
@@ -644,8 +778,8 @@ test("free text on a multi-select dialog is submitted, not un-ticked", async () 
   // Measured on a live 2.1.251 pane — typing into the free-text row ticks it
   // automatically, and the Enter the single-select path sends means "select"
   // here, so it unticks the answer and submits nothing.
-  const { herdr, sent } = fakeHerdr(() => REVIEW_SCREEN);
-  await claudeDriver.answerQuestionFreeText!(herdr, "w0:p1", MULTI_INFO, "どれでもない");
+  const { herdr, channel, sent } = fakeHerdr(() => REVIEW_SCREEN, undefined, MULTI_PROMPT);
+  await claudeDriver.answerQuestionFreeText!(herdr, channel, TEST_REF, MULTI_INFO, "どれでもない");
   assert.deepEqual(sent, [
     // options.length downs onto the free-text row, then the text ...
     "key:Down",
@@ -661,7 +795,7 @@ test("free text on a multi-select dialog is submitted, not un-ticked", async () 
 });
 
 test("free text on a single-select dialog still submits with the one Enter", async () => {
-  const { herdr, sent } = fakeHerdr(() => PREVIEW_PANE);
-  await claudeDriver.answerQuestionFreeText!(herdr, "w0:p1", PREVIEW_INFO, "別の案がある");
+  const { herdr, channel, sent } = fakeHerdr(() => PREVIEW_PANE);
+  await claudeDriver.answerQuestionFreeText!(herdr, channel, TEST_REF, PREVIEW_INFO, "別の案がある");
   assert.deepEqual(sent, ["key:Down", "key:Down", "text:別の案がある", "key:Enter"]);
 });

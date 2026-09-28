@@ -3,7 +3,8 @@ import { join } from "node:path";
 import WebSocket from "ws";
 import type { AttachmentLimits, IncomingFile } from "../attachments.js";
 import type { SpokeConfig } from "../config.js";
-import { HerdrClient } from "../herdr/client.js";
+import { HerdrBackend } from "../backend/herdr.js";
+import { createTerminals } from "../backend/index.js";
 import { hubSlug, wsUrlFor } from "../hub-url.js";
 import { PairingStore } from "../pairing.js";
 import { TurnEngine } from "../turn.js";
@@ -37,7 +38,8 @@ const HEARTBEAT_INTERVAL_MS = 30_000;
 const PONG_TIMEOUT_MS = 90_000;
 
 function connectOnce(config: SpokeConfig): Promise<void> {
-  const herdr = new HerdrClient(config.herdrBin);
+  const herdr = new HerdrBackend(config.herdrBin);
+  const terminals = createTerminals(herdr);
   const pairingStore = new PairingStore(pairingStorePathFor(config.hubUrl));
 
   return new Promise((resolve, reject) => {
@@ -128,13 +130,13 @@ function connectOnce(config: SpokeConfig): Promise<void> {
         maxFileCount: config.maxFileCount,
       };
       const turnEngine = new TurnEngine(
-        herdr,
+        terminals,
         notifier,
         { turnTimeoutMs: config.turnTimeoutMs, pollIntervalMs: config.pollIntervalMs, limits },
         pairingStore,
       );
-      const commands = new CommandHandler(herdr, pairingStore, turnEngine, notifier, config.ownerUserId);
-      const watcher = new BackgroundWatcher(herdr, pairingStore, turnEngine, notifier);
+      const commands = new CommandHandler(terminals, pairingStore, turnEngine, notifier, config.ownerUserId);
+      const watcher = new BackgroundWatcher(terminals, pairingStore, turnEngine, notifier);
       ws.once("close", () => {
         // Both halves have to stop, not just the watcher: this connection's
         // engine holds poll loops whose only way to reach Slack was the notifier

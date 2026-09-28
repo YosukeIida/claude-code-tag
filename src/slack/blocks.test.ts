@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  agentPickerBlocks,
   AQ_MULTI_CHECKBOX_ACTION_ID,
   AQ_MULTI_SUBMIT_ACTION_ID,
   askUserQuestionBlocks,
@@ -8,6 +9,7 @@ import {
   withSelectedIndices,
 } from "./blocks.js";
 import type { AskUserQuestionPaneInfo } from "../agents/driver.js";
+import type { AgentInfo, AgentStatus, BackendName, ListResult } from "../backend/types.js";
 
 /** Every element of a given type anywhere in the blocks, flattened. */
 function elementsOfType(blocks: unknown[], type: string): Array<Record<string, unknown>> {
@@ -138,4 +140,67 @@ test("anything that is not the multi-select submit passes through untouched", ()
   const single = JSON.stringify({ k: "aq", t: "w:p1", p: 1, o: 2 });
   assert.equal(withSelectedIndices(single, bodyWithSelections(["0"])), single);
   assert.equal(withSelectedIndices("not json at all", {}), "not json at all");
+});
+
+test("the agent picker groups by backend and cwd and preserves backend targets", () => {
+  const agent = (
+    target: string,
+    backend: BackendName,
+    cwd: string,
+    agentKind: AgentInfo["agent"],
+    status: AgentStatus,
+    terminalTitle: string | null,
+    displayId: string,
+  ): AgentInfo => ({
+    ref: { target, pid: null, processStartedAt: null },
+    backend,
+    agent: agentKind,
+    sessionId: null,
+    cwd,
+    evidence: { kind: "classified", status },
+    terminalTitle,
+    terminalId: "herdr-terminal-id",
+    displayId,
+  });
+  const result: ListResult = {
+    agents: [
+      agent("wT:p1", "herdr", "/work/project", "claude", "idle", "Claude session", "pane-1"),
+      agent("wT:p2", "herdr", "/work/project", "codex", "working", null, "pane-2"),
+      agent("orca:42", "orca", "/work/project", "codex", "blocked", "Remote session", "orca:42"),
+    ],
+    failures: [],
+    complete: true,
+    notices: [],
+  };
+  const blocks = agentPickerBlocks(result) as unknown as Array<{
+    accessory: {
+      option_groups: Array<{
+        label: { text: string };
+        options: Array<{ text: { text: string }; value: string }>;
+      }>;
+    };
+  }>;
+  const groups = blocks[0].accessory.option_groups;
+  assert.deepEqual(groups.map((group) => group.label.text), ["herdr · project", "orca · project"]);
+  assert.deepEqual(groups[0].options.map((option) => option.value), ["wT:p1", "wT:p2"]);
+  assert.deepEqual(groups[0].options.map((option) => option.text.text), [
+    "🟢 Claude session",
+    "🟡 [codex] pane-2",
+  ]);
+  assert.equal(groups[1].options[0].value, "orca:42");
+  assert.equal(groups[1].options[0].text.text, "🔴 [codex] Remote session");
+});
+
+test("an incomplete empty agent list explains backend failures and notices", () => {
+  const result: ListResult = {
+    agents: [],
+    failures: [{ backend: "herdr", reason: "CLI unavailable" }],
+    complete: false,
+    notices: ["Some entries were filtered."],
+  };
+  const text = JSON.stringify(agentPickerBlocks(result));
+  assert.match(text, /herdr/);
+  assert.match(text, /CLI unavailable/);
+  assert.match(text, /不完全/);
+  assert.match(text, /Some entries were filtered/);
 });

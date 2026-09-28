@@ -1,6 +1,7 @@
 import Bolt from "@slack/bolt";
 import type { Config } from "../config.js";
-import { HerdrClient } from "../herdr/client.js";
+import { HerdrBackend } from "../backend/herdr.js";
+import { createTerminals } from "../backend/index.js";
 import { PairingStore } from "../pairing.js";
 import { TurnEngine } from "../turn.js";
 import { CommandHandler, stripComposerAttribution, stripMention } from "../commands.js";
@@ -16,7 +17,8 @@ function threadTsOf(event: { thread_ts?: string; ts: string }): string {
 }
 
 export async function buildApp(config: Config) {
-  const herdr = new HerdrClient(config.herdrBin);
+  const herdr = new HerdrBackend(config.herdrBin);
+  const terminals = createTerminals(herdr);
   const pairingStore = new PairingStore();
 
   const app = new App({
@@ -33,13 +35,13 @@ export async function buildApp(config: Config) {
   const limits = { maxFileBytes: config.maxFileBytes, maxFileCount: config.maxFileCount };
   const notifier = new SlackNotifier(app.client, config.slackBotToken, limits);
   const turnEngine = new TurnEngine(
-    herdr,
+    terminals,
     notifier,
     { turnTimeoutMs: config.turnTimeoutMs, pollIntervalMs: config.pollIntervalMs, limits },
     pairingStore,
   );
-  const commands = new CommandHandler(herdr, pairingStore, turnEngine, notifier, config.ownerUserId);
-  new BackgroundWatcher(herdr, pairingStore, turnEngine, notifier).start();
+  const commands = new CommandHandler(terminals, pairingStore, turnEngine, notifier, config.ownerUserId);
+  new BackgroundWatcher(terminals, pairingStore, turnEngine, notifier).start();
 
   const mentionCache = new Map<string, string>();
   app.event("app_mention", async ({ event }) => {
