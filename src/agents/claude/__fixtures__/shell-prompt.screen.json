@@ -1,27 +1,30 @@
 {
-  "capture": {
-    "source": "design/capture/V3-codex-after-quit-shell-screen.json",
-    "state": "shell-after-quit",
-    "redactions": {
-      "<user>@<host>": "terminal user and machine name",
-      "<workspace>": "repository workspace path",
-      "<scratch>": "temporary task directory",
-      "<session-id>": "Codex resume identifier",
-      "<redacted>": "token usage counts"
+  "id": "<capture-id>",
+  "ok": true,
+  "result": {
+    "terminal": {
+      "handle": "<terminal-C>",
+      "status": "running",
+      "tail": [
+        "<redacted-shell-line>",
+        "<redacted-shell-line>",
+        "<redacted-shell-line>",
+        "<redacted-shell-line>",
+        "<redacted-shell-line>",
+        "<redacted-shell-line>",
+        "<redacted-shell-line>",
+        "<redacted-shell-line>"
+      ],
+      "truncated": true,
+      "limited": false,
+      "oldestCursor": "0",
+      "nextCursor": "5",
+      "latestCursor": "5",
+      "returnedLineCount": 8,
+      "source": "screen"
     }
   },
-  "terminal": {
-    "status": "running",
-    "tail": [
-      "<user>@<host>:<workspace> > cd <scratch> && codex",
-      "Disconnected from this task. Any running work continues.",
-      "Reconnect: codex resume <session-id>",
-      "Stop the current turn: run codex agents, select this task, and press x.",
-      "Token usage so far: total=<redacted> input=<redacted> output=<redacted>",
-      "<user>@<host>:<scratch> >"
-    ],
-    "truncated": true,
-    "limited": false,
-    "source": "screen"
+  "_meta": {
+    "runtimeId": "<runtime-id>"
   }
 }

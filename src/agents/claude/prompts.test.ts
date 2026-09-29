@@ -863,22 +863,27 @@ test("free text on a single-select dialog still submits with the one Enter", asy
   assert.deepEqual(sent, ["key:Down", "key:Down", "text:別の案がある", "key:Enter"]);
 });
 
-interface ScreenCapture {
-  terminal?: {
-    tail?: unknown;
-    draft?: unknown;
-    source?: unknown;
-    status?: unknown;
-    truncated?: unknown;
-    limited?: unknown;
-  };
+interface ScreenTerminal {
+  tail?: unknown;
+  draft?: unknown;
+  source?: unknown;
+  status?: unknown;
+  truncated?: unknown;
+  limited?: unknown;
 }
 
+interface ScreenCapture {
+  terminal?: ScreenTerminal;
+  result?: { terminal?: ScreenTerminal };
+}
+
+// Historical Claude prompt fixtures retain only `result.terminal`; tests using them are synthetic
+// at the CLI boundary because their full raw Orca envelopes were not retained.
 function capturedScreen(filename: string): ScreenSnapshot {
   const capture = JSON.parse(
     readFileSync(new URL(`./__fixtures__/${filename}`, import.meta.url), "utf8"),
   ) as ScreenCapture;
-  const terminal = capture.terminal ?? {};
+  const terminal = capture.result?.terminal ?? capture.terminal ?? {};
   const rawTail = terminal.tail;
   const tail = Array.isArray(rawTail) ? rawTail : [];
   const lines = tail.filter((line): line is string => typeof line === "string");
@@ -945,7 +950,6 @@ test("a redacted shell prompt is not a Claude composer", () => {
   const shell = capturedScreen("shell-prompt.screen.json");
   assert.equal(shell.complete, false, "the source capture is truncated");
   assert.equal(isIdleComposer(shell), false);
-  // Isolate the parser shape as well; the captured text has no Claude prompt
-  // box even when supplied as a complete-screen excerpt.
+  // The parser must reject shell text even when a caller marks the truncated frame complete.
   assert.equal(isIdleComposer({ ...shell, complete: true }), false);
 });

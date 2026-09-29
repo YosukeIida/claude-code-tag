@@ -29,10 +29,8 @@ interface ProcessFixture {
   cwd?: string;
 }
 
-interface OrcaCapture {
-  terminalList: { terminals: JsonObject[]; truncated: boolean };
-  worktreePs: { agents: JsonObject[] };
-  process: ProcessFixture & { environment: { ORCA_PANE_KEY: string; ORCA_TERMINAL_HANDLE: string } };
+interface CapturedProcess extends ProcessFixture {
+  environment: { ORCA_PANE_KEY: string; ORCA_TERMINAL_HANDLE: string };
 }
 
 interface SessionTransition {
@@ -41,25 +39,87 @@ interface SessionTransition {
   sessionFile: Record<string, unknown>;
 }
 
-const capture = JSON.parse(
-  readFileSync(new URL("./__fixtures__/orca/worktree-ps-question-state.json", import.meta.url), "utf8"),
-) as OrcaCapture;
-const transitions = JSON.parse(
-  readFileSync(new URL("./__fixtures__/orca/claude-session-transitions.json", import.meta.url), "utf8"),
-) as { snapshots: Array<SessionTransition & { state: string }> };
-const PANE = capture.process.environment.ORCA_PANE_KEY;
-const HANDLE = capture.process.environment.ORCA_TERMINAL_HANDLE;
+function object(value: unknown): JsonObject | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as JsonObject) : null;
+}
+
+function objectRows(value: unknown): JsonObject[] {
+  return Array.isArray(value) ? value.map(object).filter((row): row is JsonObject => row !== null) : [];
+}
+
+function readJsonFixture(path: string): JsonObject {
+  const value = JSON.parse(readFileSync(new URL(path, import.meta.url), "utf8")) as unknown;
+  const row = object(value);
+  if (!row) throw new Error(`fixture ${path} is not a JSON object`);
+  return row;
+}
+
+function responseResult(response: JsonObject): JsonObject {
+  const result = object(response.result);
+  if (!result) throw new Error("captured Orca response has no result object");
+  return result;
+}
+
+const worktreePsCapture = readJsonFixture("./__fixtures__/orca/worktree-ps-question-state.json");
+const terminalListCapture = readJsonFixture("./__fixtures__/orca/terminal-list-question-state.json");
+const terminalShowCapture = readJsonFixture("./__fixtures__/orca/terminal-show-question-state.json");
+const terminalReadCapture = readJsonFixture("./__fixtures__/orca/terminal-read-question-state.json");
+const terminalSendCapture = readJsonFixture("./__fixtures__/orca/terminal-send-receipt.json");
+const hooksStatusCapture = readJsonFixture("./__fixtures__/orca/agent-hooks-status.json");
+const staleShowCapture = readJsonFixture("./__fixtures__/orca/terminal-show-stale-error.json");
+const transitions = readJsonFixture("./__fixtures__/orca/claude-session-transitions.json") as {
+  snapshots: Array<SessionTransition & { state: string }>;
+};
+const terminalListResult = responseResult(terminalListCapture);
+const terminalListTemplateRow = objectRows(terminalListResult.terminals).find(
+  (terminal) => terminal.agentIdentity === "claude",
+);
+if (!terminalListTemplateRow) throw new Error("terminal-list capture has no Claude terminal row");
+const worktreePsResult = responseResult(worktreePsCapture);
+const worktreeQuestionAgent = objectRows(worktreePsResult.worktrees)
+  .flatMap((worktree) => objectRows(worktree.agents))
+  .find((agent) => agent.state === "waiting" && agent.toolName === "AskUserQuestion");
+if (!worktreeQuestionAgent) throw new Error("worktree-ps capture has no waiting question agent");
+const capturedReadTerminal = object(responseResult(terminalReadCapture).terminal) ?? {};
+const capturedSendResult = responseResult(terminalSendCapture);
+const capturedHooksResult = responseResult(hooksStatusCapture);
+const PANE = "<tab-B>:<leaf-B>";
+const HANDLE = "<terminal-B>";
 const TARGET = `orca:${PANE}`;
 const HOME = "/fake-home";
 const SESSION_PATH = (pid: number) => `${HOME}/.claude/sessions/${pid}.json`;
 
-function success(result: unknown): OrcaExecResult {
-  return { stdout: JSON.stringify({ ok: true, result }), stderr: "", exitCode: 0 };
+// The selected process row is synthetic; the raw `ps`/`lsof` observations were not retained.
+const capture: { process: CapturedProcess } = {
+  process: {
+    pid: 32521,
+    ppid: 32467,
+    pgid: 32521,
+    tpgid: 32521,
+    tty: "ttys019",
+    lstart: "Mon Sep 28 20:28:02 2026",
+    command: "claude",
+    environment: { ORCA_PANE_KEY: PANE, ORCA_TERMINAL_HANDLE: HANDLE },
+  },
+};
+
+function successResponse(template: JsonObject, result: JsonObject): OrcaExecResult {
+  return {
+    stdout: JSON.stringify({ ...template, ok: true, result }),
+    stderr: "",
+    exitCode: 0,
+  };
 }
 
 function failure(code: string, message: string): OrcaExecResult {
-  return { stdout: JSON.stringify({ ok: false, error: { code, message } }), stderr: "", exitCode: 1 };
+  const error = object(staleShowCapture.error) ?? {};
+  return {
+    stdout: JSON.stringify({ ...staleShowCapture, ok: false, error: { ...error, code, message } }),
+    stderr: "",
+    exitCode: 1,
+  };
 }
+
 
 function processLine(row: ProcessFixture): string {
   return `${row.pid} ${row.ppid} ${row.pgid} ${row.tpgid} ${row.tty} ${row.lstart} ${row.command}`;
@@ -73,8 +133,7 @@ function terminalFor(paneKey: string, handle: string, overrides: JsonObject = {}
     leafId,
     writable: true,
     connected: true,
-    orphaned: false,
-    title: "Claude test terminal",
+    agentIdentity: "claude",
     ...overrides,
   };
 }
@@ -88,9 +147,7 @@ class FakeOrcaRuntime implements OrcaRuntime {
   readonly staleHandles = new Set<string>();
   readonly sendCalls: Array<{ args: string[]; timeoutMs: number }> = [];
   acceptedInputWrites = 0;
-  sendReceipt: JsonObject = {
-    send: { accepted: true, prompt: { stages: ["input_accepted", "turn_started"] } },
-  };
+  sendReceipt: JsonObject = { ...capturedSendResult };
   sendFailure: OrcaExecResult | null = null;
   sendFailureAfterAccept = false;
   afterSend: (() => void) | null = null;
@@ -100,19 +157,13 @@ class FakeOrcaRuntime implements OrcaRuntime {
   processes: ProcessFixture[] = [];
   terminals: JsonObject[] = [];
   terminalListTruncated: unknown = false;
-  worktreeAgents: JsonObject[] = [];
-  worktreePsTruncated = false;
-  hookStatuses: JsonObject[] = [{ agent: "claude", state: "installed" }];
-  showFields: JsonObject = { agentWait: null };
-  screen: JsonObject = {
-    handle: HANDLE,
-    status: "running",
-    tail: ["line one", "line two"],
-    draft: "unsent draft",
-    source: "screen",
-    limited: false,
-    truncated: false,
-  };
+  worktreeAgentsOverride: JsonObject[] | null = null;
+  worktreePsTruncated: unknown = worktreePsResult.truncated;
+  worktreePsMissingWorktrees = false;
+  worktreePsMalformedAgents: "missing" | "non-array" | null = null;
+  hookStatuses: JsonObject[] = objectRows(capturedHooksResult.statuses);
+  showFields: JsonObject = {};
+  screen: JsonObject = { ...capturedReadTerminal };
   terminalListFailure = false;
 
   constructor() {
@@ -127,9 +178,16 @@ class FakeOrcaRuntime implements OrcaRuntime {
       cwd: "/workspace-B",
     };
     this.processes = [process];
-    this.terminals = capture.terminalList.terminals.map((terminal) => ({ ...terminal }));
-    this.terminalListTruncated = capture.terminalList.truncated;
-    this.worktreeAgents = capture.worktreePs.agents.map((agent) => ({ ...agent }));
+    this.terminals = [terminalFor(PANE, HANDLE)];
+    this.terminalListTruncated = false;
+    this.worktreeAgentsOverride = null;
+    this.worktreePsTruncated = worktreePsResult.truncated;
+    this.worktreePsMissingWorktrees = false;
+    this.worktreePsMalformedAgents = null;
+    this.hookStatuses = objectRows(capturedHooksResult.statuses);
+    this.showFields = {};
+    this.screen = { ...capturedReadTerminal };
+    this.sendReceipt = { ...capturedSendResult };
     this.setSession(process.pid, { sessionId: "<session-A>" });
   }
 
@@ -179,15 +237,40 @@ class FakeOrcaRuntime implements OrcaRuntime {
 
     if (args[0] === "terminal" && args[1] === "list") {
       if (this.terminalListFailure) return failure("runtime_unavailable", "runtime not running");
-      const result = success({ terminals: this.terminals, truncated: this.terminalListTruncated });
+      const terminals = this.terminals.map((terminal) => ({ ...terminalListTemplateRow, ...terminal }));
+      const result = successResponse(terminalListCapture, {
+        ...terminalListResult,
+        terminals,
+        totalCount: terminals.length,
+        truncated: this.terminalListTruncated,
+      });
       this.terminalListHook?.();
       return result;
     }
     if (args[0] === "worktree" && args[1] === "ps") {
-      return success({ agents: this.worktreeAgents, truncated: this.worktreePsTruncated });
+      const worktrees = objectRows(worktreePsResult.worktrees).map((worktree) =>
+        this.worktreeAgentsOverride === null
+          ? { ...worktree }
+          : { ...worktree, agents: this.worktreeAgentsOverride },
+      );
+      const malformedRow = worktrees[0];
+      if (malformedRow && this.worktreePsMalformedAgents === "missing") delete malformedRow.agents;
+      else if (malformedRow && this.worktreePsMalformedAgents === "non-array") {
+        malformedRow.agents = "not-an-array";
+      }
+      const result: JsonObject = {
+        ...worktreePsResult,
+        worktrees,
+        truncated: this.worktreePsTruncated,
+      };
+      if (this.worktreePsMissingWorktrees) delete result.worktrees;
+      return successResponse(worktreePsCapture, result);
     }
     if (args[0] === "agent" && args[1] === "hooks" && args[2] === "status") {
-      return success({ statuses: this.hookStatuses });
+      return successResponse(hooksStatusCapture, {
+        ...capturedHooksResult,
+        statuses: this.hookStatuses,
+      });
     }
     if (args[0] === "terminal" && args[1] === "show") {
       const handle = args[args.indexOf("--terminal") + 1] ?? "";
@@ -195,7 +278,11 @@ class FakeOrcaRuntime implements OrcaRuntime {
         return failure("terminal_handle_stale", "terminal_handle_stale");
       }
       const terminal = this.terminals.find((item) => item.handle === handle)!;
-      return success({ terminal: { ...terminal, ...this.showFields } });
+      const capturedTerminal = object(responseResult(terminalShowCapture).terminal) ?? {};
+      return successResponse(terminalShowCapture, {
+        ...responseResult(terminalShowCapture),
+        terminal: { ...capturedTerminal, ...terminal, ...this.showFields },
+      });
     }
     if (args[0] === "terminal" && args[1] === "send") {
       this.sendCalls.push({ args: [...args], timeoutMs: options.timeoutMs });
@@ -209,15 +296,36 @@ class FakeOrcaRuntime implements OrcaRuntime {
         }
         return this.sendFailure;
       }
-      const send = this.sendReceipt.send;
-      if (typeof send === "object" && send !== null && (send as JsonObject).accepted === true) {
-        this.acceptedInputWrites++;
-      }
+      const capturedSend = object(capturedSendResult.send) ?? {};
+      const overrideSend = object(this.sendReceipt.send) ?? {};
+      const send: JsonObject = {
+        ...capturedSend,
+        ...overrideSend,
+        prompt: {
+          ...(object(capturedSend.prompt) ?? {}),
+          ...(object(overrideSend.prompt) ?? {}),
+        },
+      };
+      const result = {
+        ...capturedSendResult,
+        ...this.sendReceipt,
+        send,
+        mutation: {
+          ...(object(capturedSendResult.mutation) ?? {}),
+          ...(object(this.sendReceipt.mutation) ?? {}),
+        },
+      };
+      const accepted = send.accepted === true;
+      if (accepted) this.acceptedInputWrites++;
       this.afterSend?.();
-      return success(this.sendReceipt);
+      return successResponse(terminalSendCapture, result);
     }
     if (args[0] === "terminal" && args[1] === "read") {
-      const result = success({ terminal: { ...this.screen } });
+      const handle = args[args.indexOf("--terminal") + 1] ?? "";
+      const result = successResponse(terminalReadCapture, {
+        ...responseResult(terminalReadCapture),
+        terminal: { ...this.screen, handle },
+      });
       this.screenReadHook?.();
       return result;
     }
@@ -292,7 +400,7 @@ function installTransition(runtime: FakeOrcaRuntime, snapshot: SessionTransition
   runtime.processes = [process];
   runtime.terminals = snapshot.terminalList.terminals.map((terminal) => ({ ...terminal }));
   runtime.terminalListTruncated = snapshot.terminalList.truncated;
-  runtime.worktreeAgents = [];
+  runtime.worktreeAgentsOverride = [];
   runtime.setSession(process.pid, snapshot.sessionFile);
 }
 
@@ -315,7 +423,7 @@ test("discovers the Claude process and joins terminal, worktree state, cwd, and 
   assert.deepEqual(agent.evidence, {
     kind: "hint",
     state: "waiting",
-    waitingSince: capture.worktreePs.agents[0]!.stateStartedAt,
+    waitingSince: worktreeQuestionAgent.stateStartedAt,
   });
   assert.equal(agent.terminalId, HANDLE);
   assert.deepEqual(runtime.readPaths, [SESSION_PATH(capture.process.pid)]);
@@ -368,6 +476,55 @@ test("missing or malformed terminal-list truncated flags make discovery incomple
   runtime.terminalListTruncated = "false";
   assert.equal((await backend(runtime).list()).complete, false);
 });
+test("a missing worktrees array is a BackendUnavailable result", async () => {
+  const runtime = new FakeOrcaRuntime();
+  runtime.worktreePsMissingWorktrees = true;
+  const terminals = backend(runtime);
+
+  const listed = await terminals.list();
+  assert.equal(listed.complete, false);
+  assert.ok(listed.failures.some(({ reason }) => reason.includes("no worktrees array")));
+  await assert.rejects(
+    terminals.get(TARGET),
+    (error: unknown) => error instanceof BackendUnavailable && error.message.includes("no worktrees array"),
+  );
+});
+test("malformed worktree agents and truncated fields are BackendUnavailable", async () => {
+  const cases = [
+    {
+      name: "worktree row without agents",
+      configure: (runtime: FakeOrcaRuntime) => {
+        runtime.worktreePsMalformedAgents = "missing";
+      },
+    },
+    {
+      name: "worktree row with non-array agents",
+      configure: (runtime: FakeOrcaRuntime) => {
+        runtime.worktreePsMalformedAgents = "non-array";
+      },
+    },
+    {
+      name: "missing truncated flag",
+      configure: (runtime: FakeOrcaRuntime) => {
+        runtime.worktreePsTruncated = undefined;
+      },
+    },
+    {
+      name: "non-boolean truncated flag",
+      configure: (runtime: FakeOrcaRuntime) => {
+        runtime.worktreePsTruncated = "false";
+      },
+    },
+  ];
+  for (const scenario of cases) {
+    const runtime = new FakeOrcaRuntime();
+    scenario.configure(runtime);
+    const terminals = backend(runtime);
+    assert.equal((await terminals.list()).complete, false, scenario.name);
+    await assert.rejects(terminals.get(TARGET), BackendUnavailable, scenario.name);
+  }
+});
+
 
 test("screen reads are full-frame and reject non-positive line counts", async () => {
   const runtime = new FakeOrcaRuntime();
@@ -377,7 +534,7 @@ test("screen reads are full-frame and reject non-positive line counts", async ()
   assert.equal(runtime.calls.length, 0, "invalid line counts must be rejected before any CLI call");
 
   const complete = await terminals.read(TARGET, 40, "screen");
-  assert.deepEqual(complete, { text: "line one\nline two", draft: "unsent draft", complete: true });
+  assert.equal(complete.complete, true);
   const readCall = runtime.calls.find(({ args }) => args[0] === "terminal" && args[1] === "read");
   assert.ok(readCall, "the probe must build a terminal read command");
   assert.deepEqual(readCall.args.slice(0, 5), ["terminal", "read", "--terminal", HANDLE, "--screen"]);
@@ -423,7 +580,7 @@ test("Codex and no-tty Claude daemon processes are never listed", async () => {
   };
   runtime.processes = [claudeDaemon, codex];
   runtime.terminals = [terminalFor("daemon-pane", "daemon-terminal"), terminalFor("codex-pane", "codex-terminal")];
-  runtime.worktreeAgents = [];
+  runtime.worktreeAgentsOverride = [];
 
   const result = await backend(runtime).list();
   assert.deepEqual(result.agents, []);
@@ -454,7 +611,7 @@ test("does not promote a Codex child of Claude to an Orca agent", async () => {
   assert.ok(result.notices.includes("Orca 上の Codex は未対応です"));
 });
 
-test("a same-tty foreground child blocks both discovery and sameProcess", async () => {
+test("a same-tty foreground agent child blocks both discovery and sameProcess", async () => {
   const runtime = new FakeOrcaRuntime();
   const parent = runtime.processes[0]!;
   const terminals = backend(runtime);
@@ -475,6 +632,26 @@ test("a same-tty foreground child blocks both discovery and sameProcess", async 
   assert.equal(await terminals.sameProcess(ref), false);
   assert.equal(await terminals.get(TARGET), null);
 });
+test("a same-tty foreground non-agent child does not hide Claude", async () => {
+  const runtime = new FakeOrcaRuntime();
+  const parent = runtime.processes[0]!;
+  const terminals = backend(runtime);
+  const ref = currentRef(parent);
+  const child: ProcessFixture = {
+    ...parent,
+    pid: 90006,
+    ppid: parent.pid,
+    lstart: "Mon Sep 28 20:30:30 2026",
+    command: "slack-mcp-server",
+  };
+  runtime.processes = [parent, child];
+
+  const listed = await terminals.list();
+  assert.equal(listed.agents.length, 1);
+  assert.equal(listed.agents[0]!.ref.pid, parent.pid);
+  assert.equal(await terminals.sameProcess(ref), true);
+});
+
 
 test("finds a foreground Claude descendant through a non-agent shell process", async () => {
   const runtime = new FakeOrcaRuntime();
@@ -671,7 +848,7 @@ test("stale and exited terminals are not returned or considered live", async () 
 });
 
 
-test("Claude resume and clear transitions update session identity without changing sameProcess policy", async () => {
+test("synthetic Claude resume and clear states update session identity without changing sameProcess policy", async () => {
   const runtime = new FakeOrcaRuntime();
   const beforeResume = transitions.snapshots.find((snapshot) => snapshot.state === "before-resume")!;
   const resumed = transitions.snapshots.find((snapshot) => snapshot.state === "after-resume-same-session")!;

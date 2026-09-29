@@ -198,7 +198,7 @@ function isDescendant(row: ProcessRow, ancestor: ProcessRow, byPid: Map<number, 
   return false;
 }
 
-/** Shared by discovery and sameProcess; a same-tty foreground descendant makes ownership uncertain. */
+/** Shared by discovery and sameProcess; an agent child on the same foreground TTY makes ownership uncertain. */
 function hasSameTtyForegroundChild(
   parent: ProcessRow,
   allRows: readonly ProcessRow[],
@@ -206,6 +206,7 @@ function hasSameTtyForegroundChild(
 ): boolean {
   return allRows.some(
     (child) =>
+      isAgentProcess(child) &&
       child.pid !== parent.pid &&
       child.tty === parent.tty &&
       isForeground(child) &&
@@ -427,12 +428,24 @@ export class OrcaBackend implements Terminals {
 
   private async worktreePs(): Promise<WorktreePs> {
     const result = object(await this.runOrca(["worktree", "ps", "--json"]));
-    if (!result || !Array.isArray(result.agents)) {
-      throw new BackendUnavailable("orca worktree ps returned no agents array");
+    if (!result || !Array.isArray(result.worktrees)) {
+      throw new BackendUnavailable("orca worktree ps returned no worktrees array");
+    }
+    const worktreeAgents = result.worktrees.map((worktree) => {
+      const row = object(worktree);
+      if (!row || !Array.isArray(row.agents)) {
+        throw new BackendUnavailable("orca worktree ps returned a worktree without agents array");
+      }
+      return row.agents;
+    });
+    if (typeof result.truncated !== "boolean") {
+      throw new BackendUnavailable("orca worktree ps returned no boolean truncated flag");
     }
     return {
-      agents: result.agents.map(object).filter((agent): agent is JsonObject => agent !== null),
-      truncated: result.truncated === true,
+      agents: worktreeAgents.flatMap((agents) =>
+        agents.map(object).filter((agent): agent is JsonObject => agent !== null),
+      ),
+      truncated: result.truncated,
     };
   }
 
