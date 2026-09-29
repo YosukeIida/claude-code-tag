@@ -10,10 +10,13 @@ import {
   type AgentInfo,
   type AgentStatus,
   type BackendName,
+  type ScreenSnapshot,
 } from "./backend/types.js";
 import type { Pairing } from "./pairing.js";
 import type { MessageHandle, Notifier } from "./notifier.js";
 import { claudeDriver } from "./agents/claude/driver.js";
+import { ompDriver, OMP_RESUME_NOTICE } from "./agents/omp/driver.js";
+import { formatOmpScreenNotice, ompScreenFingerprint } from "./agents/omp/prompts.js";
 import { WrittenFileTracker } from "./attachments.js";
 import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -46,6 +49,26 @@ function fakeAgent(status: AgentStatus, backend: BackendName = "herdr"): AgentIn
     terminalId: "herdr-terminal-id",
     terminalTitle: null,
     displayId: PANE,
+  };
+}
+
+function capturedOmpScreen(filename: string): ScreenSnapshot {
+  const capture = JSON.parse(
+    readFileSync(new URL(`./agents/omp/__fixtures__/${filename}`, import.meta.url), "utf8"),
+  ) as { terminal: Record<string, unknown> };
+  const terminal = capture.terminal;
+  const tail = terminal.tail;
+  const validTail = Array.isArray(tail) && tail.every((row) => typeof row === "string");
+  const rows = Array.isArray(tail) ? tail.filter((row): row is string => typeof row === "string") : [];
+  return {
+    text: rows.join("\n"),
+    draft: typeof terminal.draft === "string" ? terminal.draft : null,
+    complete:
+      validTail &&
+      terminal.source === "screen" &&
+      terminal.status === "running" &&
+      terminal.limited === false &&
+      terminal.truncated === false,
   };
 }
 
@@ -837,6 +860,347 @@ test("Orca rejects original C0 text before downloading attachments", async () =>
     assert.equal(engine.isBusy(target), false);
   } finally {
     engine.abortAll();
+  }
+});
+
+test("OMP turns submit normal text and keep their poll loop attached", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cctag-omp-turn-submit-"));
+  const target = `orca:${PANE}`;
+  const pairing: Pairing = { ...fakePairing(), paneId: target, backend: "orca", cwd: dir };
+  const sessionId = "9a51b84e-610c-4d9e-bb20-28d7c850c552";
+  const transcriptIdentity = { path: join(dir, "omp.jsonl"), device: "1", inode: "2" };
+  const submitted: string[] = [];
+  const terminals = fakeBackend(
+    () => "idle",
+    () => "",
+    {
+      async get(receivedTarget) {
+        return {
+          ...fakeAgent("idle", "orca"),
+          agent: "omp",
+          ref: {
+            target: receivedTarget,
+            pid: 42,
+            processStartedAt: 1,
+            agentKind: "omp",
+            sessionId,
+            transcriptIdentity,
+          },
+          sessionId,
+          transcriptIdentity,
+        };
+      },
+      async submit(_ref, text) {
+        submitted.push(text);
+        return "accepted";
+      },
+    },
+    "orca",
+  );
+  const { notifier } = fakeNotifier();
+  const engine = engineFor(terminals, notifier, 600_000);
+
+  try {
+    await engine.startTurn(pairing, "U1", "hello");
+    assert.deepEqual(submitted, ["hello"]);
+    assert.equal(engine.isBusy(target), true, "accepted OMP turns keep ownership while awaiting transcript/screen evidence");
+  } finally {
+    engine.abortAll();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an accepted OMP turn ignores historical completion until its own transcript boundary", { timeout: 10_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cctag-omp-stale-end-"));
+  const target = `orca:${PANE}`;
+  const sessionId = "omp-stale-end";
+  const transcriptPath = join(dir, "omp-session.jsonl");
+  const transcriptIdentity = { path: transcriptPath, device: "1", inode: "2" };
+  const pairing: Pairing = { ...fakePairing(), paneId: target, backend: "orca", cwd: dir };
+  const historicalRecords = [
+    {
+      type: "message",
+      timestamp: "2026-09-28T10:00:00.000Z",
+      message: { role: "user", content: [{ type: "text", text: "old prompt" }] },
+    },
+    {
+      type: "message",
+      timestamp: "2026-09-28T10:00:01.000Z",
+      message: {
+        role: "assistant",
+        stopReason: "stop",
+        content: [{ type: "text", text: "old OMP output" }],
+      },
+    },
+  ];
+  writeFileSync(transcriptPath, `${historicalRecords.map((record) => JSON.stringify(record)).join("\n")}\n`);
+
+  let submitted = false;
+  let pollCount = 0;
+  let signalFirstPoll!: () => void;
+  const firstPoll = new Promise<void>((resolve) => (signalFirstPoll = resolve));
+  const terminals = fakeBackend(
+    () => "working",
+    () => "",
+    {
+      async get(receivedTarget) {
+        if (submitted && pollCount++ === 0) signalFirstPoll();
+        return {
+          ...fakeAgent(submitted ? "working" : "idle"),
+          ref: {
+            target: receivedTarget,
+            pid: 42,
+            processStartedAt: 1,
+            agentKind: "omp",
+            sessionId,
+            transcriptIdentity,
+          },
+          backend: "orca",
+          agent: "omp",
+          sessionId,
+          cwd: dir,
+          transcriptIdentity,
+          evidence: { kind: "hint", state: "done", waitingSince: null },
+        };
+      },
+      async read() {
+        return { text: "", draft: null, complete: false };
+      },
+      async submit() {
+        submitted = true;
+        return "accepted";
+      },
+    },
+    "orca",
+  );
+  const { notifier, posts, updates } = fakeNotifier();
+  const engine = new TurnEngine(
+    terminals,
+    notifier,
+    { turnTimeoutMs: 600_000, pollIntervalMs: 100, limits: { maxFileBytes: 1024, maxFileCount: 1 } },
+    { list: () => [pairing] },
+  );
+
+  try {
+    await engine.startTurn(pairing, "U1", "new OMP prompt");
+    await firstPoll;
+    await sleep(20);
+    assert.equal(engine.isBusy(target), true, "a historical completion must not finalize an accepted fresh turn");
+    assert.equal(updates.some(({ text }) => text.startsWith("✅")), false);
+    assert.equal(posts.some((post) => post.includes("old OMP output")), false);
+
+    const newRecords = [
+      {
+        type: "message",
+        timestamp: "2026-09-28T10:05:00.000Z",
+        message: { role: "user", content: [{ type: "text", text: "new prompt" }] },
+      },
+      {
+        type: "message",
+        timestamp: "2026-09-28T10:05:01.000Z",
+        message: {
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "new OMP response" }],
+        },
+      },
+    ];
+    appendFileSync(transcriptPath, `${newRecords.map((record) => JSON.stringify(record)).join("\n")}\n`);
+    for (let i = 0; i < 100; i++) {
+      if (!engine.isBusy(target) && posts.join("\n").includes("new OMP response")) break;
+      await sleep(20);
+    }
+
+    assert.equal(engine.isBusy(target), false, "a newly observed completion should release the turn");
+    assert.ok(posts.some((post) => post.includes("new OMP response")), JSON.stringify(posts));
+  } finally {
+    engine.abortAll();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+
+test("adopted OMP waits post one plain screen notice and resolve it at the terminal", async () => {
+  const target = `orca:${PANE}`;
+  const sessionId = "9a51b84e-610c-4d9e-bb20-28d7c850c552";
+  const transcriptDir = mkdtempSync(join(tmpdir(), "cctag-omp-turn-wait-"));
+  const transcriptPath = join(transcriptDir, "omp-session.jsonl");
+  writeFileSync(transcriptPath, "");
+  const transcriptIdentity = { path: transcriptPath, device: "1", inode: "2" };
+  const agent: AgentInfo = {
+    ...fakeAgent("working", "orca"),
+    ref: {
+      target,
+      pid: 42,
+      processStartedAt: 1,
+      agentKind: "omp",
+      sessionId,
+      transcriptIdentity,
+    },
+    backend: "orca",
+    agent: "omp",
+    sessionId,
+    transcriptIdentity,
+    evidence: { kind: "hint", state: "working", waitingSince: null },
+  };
+  const waiting = capturedOmpScreen("ask-open.screen.json");
+  const idle = capturedOmpScreen("idle.screen.json");
+  const notice = formatOmpScreenNotice(waiting);
+  const fingerprint = ompScreenFingerprint(waiting);
+  assert.ok(notice);
+  assert.ok(fingerprint);
+  let screen = waiting;
+  let failNextRead = false;
+  let terminalWrites = 0;
+  let screenReads = 0;
+  let lastReadText = "";
+  const terminals = fakeBackend(
+    () => "working",
+    () => "",
+    {
+      async get() {
+        return agent;
+      },
+      async read() {
+        screenReads++;
+        if (failNextRead) {
+          failNextRead = false;
+          throw new Error("screen unavailable");
+        }
+        lastReadText = screen.text;
+        return screen;
+      },
+      async submit() {
+        terminalWrites++;
+        return "accepted";
+      },
+    },
+    "orca",
+  );
+  const { notifier, posts, postedBlocks, updates } = fakeNotifier();
+  const engine = engineFor(terminals, notifier, 600_000);
+  const pairing: Pairing = { ...fakePairing(), paneId: target, backend: "orca" };
+
+  try {
+    assert.equal(
+      await engine.adoptBlockedTerminal(pairing, {
+        backend: "orca",
+        driver: ompDriver,
+        sessionId,
+        transcriptIdentity,
+        transcriptPath: transcriptIdentity.path,
+        offset: 0,
+        collected: [],
+        paneId: target,
+        ref: agent.ref,
+        cwd: agent.cwd,
+        outboxBaseline: {},
+        writes: new WrittenFileTracker(),
+        ompStatus: { waitingFingerprint: fingerprint, waitingSamples: 2, noticeFingerprint: null },
+        ompNotice: notice,
+        ompFingerprint: fingerprint,
+      }),
+      true,
+    );
+    assert.equal(engine.isOmpWaiting(target), true);
+    assert.deepEqual(posts, ["🖥️ ターミナル側で入力待ちを検出しました…", notice]);
+    assert.deepEqual(postedBlocks[1], [], "OMP notice has no answer buttons");
+    failNextRead = true;
+    await sleep(5_100);
+    assert.equal(engine.isOmpWaiting(target), true, "an unreadable screen does not release the blocked wait");
+    assert.equal(posts.filter((post) => post === notice).length, 1, "a failed screen read does not repost");
+    assert.equal(terminalWrites, 0);
+
+    screen = idle;
+    for (let i = 0; i < 1_100 && engine.isOmpWaiting(target); i++) await sleep(10);
+    assert.equal(lastReadText, idle.text, `poll must observe the complete idle screen (${screenReads} reads)`);
+    assert.equal(engine.isOmpWaiting(target), false, "a complete idle composer releases the terminal-only wait");
+    assert.ok(updates.some((update) => update.text === `${notice}\n\n（ターミナル側で回答済み）`));
+  } finally {
+    engine.abortAll();
+    rmSync(transcriptDir, { recursive: true, force: true });
+  }
+});
+
+test("OMP turn discards records and posts only the loss notice when ownership changes after a read", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cctag-omp-turn-loss-"));
+  let engine: TurnEngine | undefined;
+  try {
+    const cwd = join(dir, "cwd");
+    mkdirSync(cwd);
+    const transcriptPath = join(dir, "omp-session.jsonl");
+    const sessionId = "9a51b84e-610c-4d9e-bb20-28d7c850c552";
+    const transcriptIdentity = { path: transcriptPath, device: "1", inode: "2" };
+    const record = {
+      type: "message",
+      timestamp: "2026-09-28T22:53:54.622Z",
+      message: { role: "assistant", content: [{ type: "text", text: "must not be posted" }] },
+    };
+    writeFileSync(transcriptPath, `${JSON.stringify(record)}\n`);
+    const target = `orca:${PANE}`;
+    const pairing: Pairing = { ...fakePairing(), paneId: target, backend: "orca", cwd };
+    const agent: AgentInfo = {
+      ...fakeAgent("working", "orca"),
+      agent: "omp",
+      ref: {
+        target,
+        pid: 42,
+        processStartedAt: 1,
+        agentKind: "omp",
+        sessionId,
+        transcriptIdentity,
+      },
+      sessionId,
+      transcriptIdentity,
+      cwd,
+      evidence: { kind: "hint", state: "working", waitingSince: null },
+    };
+    let gets = 0;
+    const terminals = fakeBackend(
+      () => "working",
+      () => "",
+      {
+        async get() {
+          gets++;
+          return gets === 1 ? agent : null;
+        },
+        async exists() {
+          return true;
+        },
+      },
+      "orca",
+    );
+    const { notifier, posts } = fakeNotifier();
+    engine = new TurnEngine(
+      terminals,
+      notifier,
+      { turnTimeoutMs: 60_000, pollIntervalMs: 5, limits: { maxFileBytes: 1024, maxFileCount: 1 } },
+      { list: () => [pairing] },
+    );
+
+    const adopted = await engine.adoptBlockedTerminal(pairing, {
+      backend: "orca",
+      driver: ompDriver,
+      sessionId,
+      transcriptPath,
+      transcriptIdentity,
+      offset: 0,
+      collected: [],
+      paneId: target,
+      ref: agent.ref,
+      cwd,
+      outboxBaseline: {},
+      writes: new WrittenFileTracker(),
+    });
+    assert.equal(adopted, true);
+    for (let i = 0; i < 40 && engine.isBusy(target); i++) await sleep(10);
+
+    assert.equal(engine.isBusy(target), false);
+    assert.equal(posts.filter((post) => post === OMP_RESUME_NOTICE).length, 1);
+    assert.equal(posts.some((post) => post.includes("must not be posted")), false);
+  } finally {
+    engine?.abortAll();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

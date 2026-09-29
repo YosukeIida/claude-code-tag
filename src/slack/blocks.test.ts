@@ -142,7 +142,7 @@ test("anything that is not the multi-select submit passes through untouched", ()
   assert.equal(withSelectedIndices("not json at all", {}), "not json at all");
 });
 
-test("the agent picker groups by backend and cwd and preserves backend targets", () => {
+test("the agent picker groups by backend and cwd, with a distinct OMP group", () => {
   const agent = (
     target: string,
     backend: BackendName,
@@ -168,6 +168,7 @@ test("the agent picker groups by backend and cwd and preserves backend targets",
       agent("wT:p1", "herdr", "/work/project", "claude", "idle", "Claude session", "pane-1"),
       agent("wT:p2", "herdr", "/work/project", "codex", "working", null, "pane-2"),
       agent(orcaTarget, "orca", "/work/project", "codex", "blocked", "Remote session", "orca:42"),
+      agent("orca:omp-pane", "orca", "/work/project", "omp", "working", "OMP session", "omp-pane"),
     ],
     failures: [],
     complete: true,
@@ -182,16 +183,17 @@ test("the agent picker groups by backend and cwd and preserves backend targets",
     };
   }>;
   const groups = blocks[0].accessory.option_groups;
-  assert.deepEqual(groups.map((group) => group.label.text), ["herdr · project", "orca · project"]);
-  assert.deepEqual(groups[0].options.map((option) => option.value), ["wT:p1", "wT:p2"]);
-  assert.deepEqual(groups[0].options.map((option) => option.text.text), [
+  assert.deepEqual(groups.map((group) => group.label.text), ["herdr · project", "orca · project", "omp · project"]);
+  assert.deepEqual(groups[0]!.options.map((option) => option.value), ["wT:p1", "wT:p2"]);
+  assert.deepEqual(groups[0]!.options.map((option) => option.text.text), [
     "🟢 Claude session",
     "🟡 [codex] pane-2",
   ]);
-  assert.equal(groups[1].options[0].value, orcaTarget);
-  assert.equal(groups[1].options[0].value.length, 78);
-  assert.ok(groups[1].options[0].value.length <= 150, "the Orca target must fit Slack's option value limit");
-  assert.equal(groups[1].options[0].text.text, "🔴 [codex] Remote session");
+  assert.equal(groups[1]!.options[0]!.value, orcaTarget);
+  assert.equal(groups[1]!.options[0]!.value.length, 78);
+  assert.ok(groups[1]!.options[0]!.value.length <= 150, "the Orca target must fit Slack's option value limit");
+  assert.equal(groups[1]!.options[0]!.text.text, "🔴 [codex] Remote session");
+  assert.equal(groups[2]!.options[0]!.text.text, "🟡 [omp] OMP session");
 });
 
 test("an incomplete empty agent list explains backend failures and notices", () => {

@@ -22,15 +22,22 @@ import {
   WriteOutcomeUnknown,
   WRITE_OUTCOME_UNKNOWN_MESSAGE,
 } from "./backend/types.js";
-import type { AgentInfo, AgentRef, AgentStatus, BackendName } from "./backend/types.js";
+import type { AgentInfo, AgentRef, AgentStatus, BackendName, ScreenSnapshot, TranscriptIdentity } from "./backend/types.js";
 import { backendForTarget } from "./backend/target.js";
 import { PaneLeaseRegistry, type PaneLease } from "./leases.js";
-import { EMPTY_TRANSCRIPT_BOUNDARIES, resolveStatus, SettleTracker, transcriptBoundaries } from "./settle.js";
+import { EMPTY_TRANSCRIPT_BOUNDARIES, resolveStatus, SettleTracker, transcriptBoundaries, type StatusResolution } from "./settle.js";
 import type { Pairing } from "./pairing.js";
 import { isUnsupportedByRemote, type MessageHandle, type Notifier } from "./notifier.js";
 import { readNewRecords, readRecentRecords, transcriptSizeSafe } from "./agents/transcript.js";
 import { driverFor, type AgentDriver, type AskUserQuestionPaneInfo, type BlockedPrompt } from "./agents/driver.js";
 import { promptFingerprint } from "./agents/fingerprint.js";
+import {
+  createOmpStatusMemory,
+  markOmpNoticePosted,
+  resolveOmpStatus,
+  type OmpStatusMemory,
+  type OmpStatusResolution,
+} from "./agents/omp/status.js";
 import { chunkForSlack, markdownToMrkdwn } from "./slack/mrkdwn.js";
 import { postSegmented } from "./slack/post.js";
 import {
@@ -44,9 +51,23 @@ import {
 import { randomInt } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
+import { OMP_RESUME_NOTICE } from "./agents/omp/driver.js";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function sameTranscriptIdentity(
+  left: TranscriptIdentity | undefined,
+  right: TranscriptIdentity | undefined,
+): boolean {
+  return (
+    left !== undefined &&
+    right !== undefined &&
+    left.path === right.path &&
+    left.device === right.device &&
+    left.inode === right.inode
+  );
 }
 
 const PROMPT_ID_LIMIT = 2 ** 48;
@@ -116,7 +137,7 @@ function waitBeforeNextPoll(state: TurnState, ms: number): Promise<void> {
   });
 }
 
-export type TurnPhase = "running" | "awaiting-question" | "awaiting-permission";
+export type TurnPhase = "running" | "awaiting-question" | "awaiting-permission" | "awaiting-omp";
 
 interface TurnState {
   phase: TurnPhase;
@@ -130,6 +151,7 @@ interface TurnState {
   cwd: string;
   sessionId: string;
   transcriptPath: string;
+  transcriptIdentity?: TranscriptIdentity;
   offset: number;
   collected: string[];
   /** `<cwd>/.cctag/outbox` as it looked when the turn began, so only what this
@@ -157,6 +179,9 @@ interface TurnState {
    * carries the turn's open/closed state, so it must not outlive it.
    */
   settle: SettleTracker;
+  /** OMP's consecutive-screen and one-notice-per-fingerprint memory. */
+  ompStatus: OmpStatusMemory | null;
+  ompNoticeText?: string;
   /** Last resolved status, retained only for this turn's incomplete-screen path. */
   previousStatus: AgentStatus;
   /**
@@ -260,6 +285,7 @@ export interface BlockedTerminalHandoff {
   driver: AgentDriver;
   sessionId: string;
   transcriptPath: string;
+  transcriptIdentity?: TranscriptIdentity;
   offset: number;
   collected: string[];
   paneId: string;
@@ -273,6 +299,10 @@ export interface BlockedTerminalHandoff {
   /** Write tracking so far, handed over rather than restarted for the same
    *  reason — a write confirmed before the block still needs uploading. */
   writes: WrittenFileTracker;
+  /** Handoff evidence already confirmed twice by the watcher. */
+  ompStatus?: OmpStatusMemory;
+  ompNotice?: string;
+  ompFingerprint?: string;
 }
 
 export class TurnEngine {
@@ -299,6 +329,10 @@ export class TurnEngine {
 
   isBusy(paneId: string): boolean {
     return this.leases.isHeld(paneId);
+  }
+  isOmpWaiting(paneId: string): boolean {
+    const state = this.turns.get(paneId);
+    return state?.driver.kind === "omp" && (state.phase === "awaiting-omp" || state.previousStatus === "blocked");
   }
 
   /**
@@ -367,6 +401,7 @@ export class TurnEngine {
         throw new SubmitRefused("unsafe-text", UNSENDABLE_TEXT_MESSAGE);
       }
 
+
       // Downloading happens here, inside the reservation, not in the caller:
       // a several-megabyte transfer can take a minute, and doing it before the
       // pane is reserved lets a later short message start its turn first and
@@ -387,7 +422,7 @@ export class TurnEngine {
         : text;
 
       const sessionId = agent.sessionId ?? "";
-      const tPath = driver.locateTranscript(agent.cwd, agent.sessionId) ?? "";
+      const tPath = agent.transcriptIdentity?.path ?? driver.locateTranscript(agent.cwd, agent.sessionId) ?? "";
       const offset = tPath ? transcriptSizeSafe(tPath) : 0;
 
       // A pane sitting at one of the agent's startup dialogs reports `idle`, so
@@ -444,6 +479,7 @@ export class TurnEngine {
         cwd: agent.cwd,
         sessionId,
         transcriptPath: tPath,
+        transcriptIdentity: agent.transcriptIdentity,
         offset,
         collected: [],
         outboxBaseline: snapshotOutbox(agent.cwd),
@@ -458,6 +494,7 @@ export class TurnEngine {
         failures: { get: 0, read: 0 },
         lease,
         promptId: null,
+        ompStatus: driver.kind === "omp" ? createOmpStatusMemory() : null,
       };
       this.turns.set(paneId, state);
 
@@ -565,14 +602,10 @@ export class TurnEngine {
   }
 
   /**
-   * BackgroundWatcher calls this when it notices a paired terminal has gone
-   * `blocked` with no active Slack-initiated turn running (i.e. work started
-   * directly at the terminal just hit an AskUserQuestion or permission
-   * prompt). Registering a TurnState and running the same pollLoop() a
-   * normal turn uses means the existing AskUserQuestion/permission button
-   * flow — and answering it from Slack — works identically whether the turn
-   * was Slack-initiated or discovered mid-flight; no input is sent, since
-   * the terminal is already sitting at the prompt.
+   * BackgroundWatcher calls this when a paired terminal has become blocked
+   * without an active Slack turn. Interactive drivers expose the prompt for
+   * Slack answers; OMP carries its confirmed screen notice here and stays
+   * terminal-only.
    */
   async adoptBlockedTerminal(pairing: Pairing, handoff: BlockedTerminalHandoff): Promise<boolean> {
     const paneId = pairing.paneId;
@@ -609,6 +642,7 @@ export class TurnEngine {
         cwd: handoff.cwd,
         sessionId: handoff.sessionId,
         transcriptPath: handoff.transcriptPath,
+        transcriptIdentity: handoff.transcriptIdentity,
         offset: handoff.offset,
         collected: [...handoff.collected],
         outboxBaseline: handoff.outboxBaseline,
@@ -623,6 +657,8 @@ export class TurnEngine {
         failures: { get: 0, read: 0 },
         lease,
         promptId: null,
+        ompStatus:
+          handoff.driver.kind === "omp" ? (handoff.ompStatus ?? createOmpStatusMemory()) : null,
       };
       this.turns.set(paneId, state);
 
@@ -632,6 +668,13 @@ export class TurnEngine {
       if (lease.cancelled) {
         this.turns.delete(paneId);
         return false;
+      }
+      if (
+        handoff.driver.kind === "omp" &&
+        handoff.ompNotice &&
+        handoff.ompFingerprint
+      ) {
+        await this.postOmpNotice(state, handoff.ompNotice, handoff.ompFingerprint);
       }
 
       handedToPollLoop = true;
@@ -950,6 +993,7 @@ export class TurnEngine {
     state.planFeedbackOptionNum = undefined;
     state.answering = false;
     state.phase = "running";
+    state.ompNoticeText = undefined;
   }
 
   /**
@@ -1032,6 +1076,27 @@ export class TurnEngine {
     state.phase = "awaiting-permission";
   }
 
+  private async postOmpNotice(state: TurnState, text: string, fingerprint: string): Promise<void> {
+    try {
+      const handle = await this.notifier.postMessage(state.pairing.channel, state.pairing.threadTs ?? "", text);
+      state.promptHandle = handle;
+      state.promptFingerprint = fingerprint;
+      state.promptId = null;
+      state.pendingPrompt = undefined;
+      state.pendingQuestionInfo = undefined;
+      state.planFeedbackOptionNum = undefined;
+      state.answering = false;
+      state.ompNoticeText = text;
+      if (state.ompStatus) state.ompStatus = markOmpNoticePosted(state.ompStatus, fingerprint);
+      state.phase = "awaiting-omp";
+    } catch (error) {
+      console.error(
+        `[turn ${state.paneId}] OMP waiting notice post failed:`,
+        error instanceof Error ? error.message : error,
+      );
+    }
+  }
+
   private async pollLoop(state: TurnState): Promise<void> {
     const paneId = state.paneId;
     try {
@@ -1044,6 +1109,60 @@ export class TurnEngine {
       if (this.turns.get(paneId) === state) this.turns.delete(paneId);
       state.lease.release();
     }
+  }
+
+  private switchOmpSession(state: TurnState, agent: AgentInfo): void {
+    state.driver = driverFor(agent.agent);
+    state.ref = agent.ref;
+    state.cwd = agent.cwd;
+    state.sessionId = agent.sessionId ?? "";
+    state.transcriptIdentity = agent.transcriptIdentity;
+    state.transcriptPath = agent.transcriptIdentity?.path ?? "";
+    state.offset = state.transcriptPath ? transcriptSizeSafe(state.transcriptPath) : 0;
+    state.collected = [];
+    state.writes = new WrittenFileTracker();
+    state.toolCounts = {};
+    state.outboxBaseline = snapshotOutbox(agent.cwd);
+    state.settle = new SettleTracker();
+    state.previousStatus = "working";
+    state.deadlineAt = Date.now() + this.opts.turnTimeoutMs;
+    state.ompStatus = agent.agent === "omp" ? createOmpStatusMemory() : null;
+  }
+
+  private async revalidateOmpTranscript(
+    state: TurnState,
+    beforeRead: AgentInfo,
+  ): Promise<"same" | "changed" | "lost" | "retry"> {
+    let current: AgentInfo | null;
+    try {
+      current = await this.terminals.get(state.paneId);
+      state.failures.get = 0;
+    } catch (error) {
+      state.failures.get++;
+      if (state.failures.get <= BACKEND_FAILURES_BEFORE_GIVING_UP) {
+        console.error(
+          `[turn ${state.paneId}] OMP transcript ownership query failed (${state.failures.get}/${BACKEND_FAILURES_BEFORE_GIVING_UP}), retrying:`,
+          error instanceof Error ? error.message : error,
+        );
+        return "retry";
+      }
+      await this.finalize(state, `⚠️ ${state.backend}への問い合わせが連続して失敗しました（部分的な出力のみ）`);
+      return "lost";
+    }
+    if (!current || current.agent !== "omp" || !current.transcriptIdentity) {
+      state.collected = [];
+      state.writes = new WrittenFileTracker();
+      await this.finalize(state, OMP_RESUME_NOTICE);
+      return "lost";
+    }
+    if (
+      current.sessionId !== beforeRead.sessionId ||
+      !sameTranscriptIdentity(current.transcriptIdentity, beforeRead.transcriptIdentity)
+    ) {
+      this.switchOmpSession(state, current);
+      return "changed";
+    }
+    return "same";
   }
 
   private async poll(state: TurnState): Promise<void> {
@@ -1084,34 +1203,56 @@ export class TurnEngine {
         return;
       }
       if (!agent) {
-        await this.finalize(state, "⚠️ インスタンスが終了しました（部分的な出力のみ）");
+        await this.finalize(
+          state,
+          state.driver.kind === "omp" ? OMP_RESUME_NOTICE : "⚠️ インスタンスが終了しました（部分的な出力のみ）",
+        );
+        return;
+      }
+      if (state.driver.kind === "omp" && agent.agent !== "omp") {
+        state.collected = [];
+        state.writes = new WrittenFileTracker();
+        await this.finalize(state, OMP_RESUME_NOTICE);
         return;
       }
 
-      if (agent.sessionId && agent.sessionId !== state.sessionId) {
-        state.sessionId = agent.sessionId;
-        state.transcriptPath = state.driver.locateTranscript(agent.cwd, agent.sessionId) ?? "";
-        state.offset = 0;
-        // Session-local lifecycle and screen evidence must not leak to this transcript.
-        state.settle = new SettleTracker();
-        state.previousStatus = "working";
+      const sessionChanged = Boolean(agent.sessionId && agent.sessionId !== state.sessionId);
+      const identityChanged =
+        state.driver.kind === "omp" &&
+        !sameTranscriptIdentity(state.transcriptIdentity, agent.transcriptIdentity);
+      if (sessionChanged || identityChanged) {
+        if (state.driver.kind === "omp") {
+          this.switchOmpSession(state, agent);
+        } else {
+          state.sessionId = agent.sessionId ?? "";
+          state.transcriptIdentity = agent.transcriptIdentity;
+          state.transcriptPath =
+            agent.transcriptIdentity?.path ?? state.driver.locateTranscript(agent.cwd, agent.sessionId) ?? "";
+          state.offset = 0;
+          // Session-local lifecycle and screen evidence must not leak to this transcript.
+          state.settle = new SettleTracker();
+          state.previousStatus = "working";
+        }
       } else if (!state.transcriptPath) {
-        // Still no transcript (herdr may never report a sessionId at all —
-        // e.g. its SessionStart hook is being blocked — so the branch above
-        // never fires). Retry the driver's cwd-based fallback every poll:
-        // the very first attempt (at turn start, in startTurn()) can miss if
-        // Claude Code hasn't created the session's transcript file yet, and
-        // without this retry that miss is permanent for the rest of the turn.
-        const located = state.driver.locateTranscript(agent.cwd, agent.sessionId) ?? "";
+        // Retry the cwd-based fallback if transcript creation was delayed.
+        const located =
+          agent.transcriptIdentity?.path ?? state.driver.locateTranscript(agent.cwd, agent.sessionId) ?? "";
         if (located) {
           state.transcriptPath = located;
-          state.offset = 0;
+          state.transcriptIdentity = agent.transcriptIdentity;
+          state.offset = state.driver.kind === "omp" ? transcriptSizeSafe(located) : 0;
         }
       }
 
       if (state.transcriptPath) {
-        const { records, newOffset } = await readNewRecords(state.transcriptPath, state.offset);
-        const grew = newOffset > state.offset;
+        const readOffset = state.offset;
+        const { records, newOffset } = await readNewRecords(state.transcriptPath, readOffset);
+        if (state.driver.kind === "omp") {
+          const ownership = await this.revalidateOmpTranscript(state, agent);
+          if (ownership === "lost") return;
+          if (ownership !== "same") continue;
+        }
+        const grew = newOffset > readOffset;
         state.offset = newOffset;
         const output = state.driver.extractTurnOutput(records);
         state.collected.push(...output.texts);
@@ -1120,12 +1261,7 @@ export class TurnEngine {
         }
         state.writes.ingest(output);
         state.settle.observe(output.lifecycle ?? []);
-        // Progress in the transcript is proof the agent is alive and working, so
-        // the deadline measures silence rather than total elapsed time. Without
-        // this a genuinely long turn was cut at turnTimeoutMs no matter how much
-        // it was producing — the timeout's own doc comment says it should only
-        // measure how long the agent has gone without progress, and a blocked
-        // pane was the only thing that used to satisfy it.
+        // Transcript growth proves the agent is alive and working.
         if (grew) state.deadlineAt = Date.now() + this.opts.turnTimeoutMs;
       }
 
@@ -1146,24 +1282,63 @@ export class TurnEngine {
       // the check would already have lapsed by the time the next poll reads it.
       // Shared resolution preserves herdr's classified correction and applies
       // Orca's timestamp/status hints without confusing either with output offsets.
-      const boundaries =
-        agent.evidence.kind === "hint" && state.transcriptPath
-          ? transcriptBoundaries(state.driver.extractLifecycle(await readRecentRecords(state.transcriptPath)))
-          : EMPTY_TRANSCRIPT_BOUNDARIES;
-      const resolution = await resolveStatus({
-        evidence: agent.evidence,
-        settle: state.settle,
-        boundaries,
-        previousStatus: state.previousStatus,
-        readScreen: async () => {
-          const snapshot = await this.terminals.read(state.paneId, 40, "screen");
+      let boundaries = EMPTY_TRANSCRIPT_BOUNDARIES;
+      if (agent.evidence.kind === "hint" && state.transcriptPath) {
+        const recentRecords = await readRecentRecords(state.transcriptPath);
+        if (state.driver.kind === "omp") {
+          const ownership = await this.revalidateOmpTranscript(state, agent);
+          if (ownership === "lost") return;
+          if (ownership !== "same") continue;
+        }
+        boundaries = transcriptBoundaries(state.driver.extractLifecycle(recentRecords));
+      }
+
+      let resolution: StatusResolution;
+      let ompResolution: OmpStatusResolution | null = null;
+      if (state.driver.kind === "omp") {
+        let snapshot: ScreenSnapshot | null = null;
+        try {
+          snapshot = await this.terminals.read(state.paneId, BLOCKED_PANE_LINES, "screen");
           state.failures.read = 0;
-          return {
-            snapshot,
-            fingerprint: snapshot.complete ? promptFingerprint(state.driver.parseBlockedPane(snapshot.text)) : null,
-          };
-        },
-      });
+        } catch (error) {
+          state.failures.read++;
+          if (state.failures.read === 1) {
+            console.error(
+              `[turn ${paneId}] OMP screen read failed; retaining prior state:`,
+              error instanceof Error ? error.message : error,
+            );
+          }
+        }
+        if (state.transcriptPath) {
+          const ownership = await this.revalidateOmpTranscript(state, agent);
+          if (ownership === "lost") return;
+          if (ownership !== "same") continue;
+        }
+        ompResolution = resolveOmpStatus({
+          settle: state.settle,
+          boundaries,
+          previousStatus: state.previousStatus,
+          memory: state.ompStatus ?? createOmpStatusMemory(),
+          snapshot,
+        });
+        state.ompStatus = ompResolution.memory;
+        resolution = ompResolution;
+      } else {
+        resolution = await resolveStatus({
+          evidence: agent.evidence,
+          settle: state.settle,
+          boundaries,
+          previousStatus: state.previousStatus,
+          readScreen: async () => {
+            const snapshot = await this.terminals.read(state.paneId, 40, "screen");
+            state.failures.read = 0;
+            return {
+              snapshot,
+              fingerprint: snapshot.complete ? promptFingerprint(state.driver.parseBlockedPane(snapshot.text)) : null,
+            };
+          },
+        });
+      }
       const status = resolution.status;
       state.previousStatus = status;
       const blocked = status === "blocked";
@@ -1175,6 +1350,12 @@ export class TurnEngine {
       }
 
       if (blocked) {
+        if (state.driver.kind === "omp") {
+          if (ompResolution?.notice && ompResolution.fingerprint) {
+            await this.postOmpNotice(state, ompResolution.notice, ompResolution.fingerprint);
+          }
+          continue;
+        }
         // Staying busy for as long as the prompt is up is what stops
         // BackgroundWatcher from re-adopting the pane and posting the same
         // prompt again; and a pane sitting at a prompt is not one a new turn
@@ -1239,12 +1420,23 @@ export class TurnEngine {
         // else: still the same prompt we already posted — keep waiting.
         continue;
       }
+      if (
+        state.driver.kind === "omp" &&
+        state.phase === "awaiting-omp" &&
+        !ompResolution?.releaseBlocked
+      ) {
+        continue;
+      }
 
       if (state.phase !== "running") {
         // Was awaiting an answer, and the terminal is no longer blocked —
         // resolved, either by our own button/free-text (which already
         // cleared promptHandle) or directly at the terminal keyboard.
-        await state.promptHandle?.update(this.answeredAtTerminalText(state), []).catch(() => {});
+        const resolvedText =
+          state.driver.kind === "omp" && state.ompNoticeText
+            ? `${state.ompNoticeText}\n\n（ターミナル側で回答済み）`
+            : this.answeredAtTerminalText(state);
+        await state.promptHandle?.update(resolvedText, []).catch(() => {});
         this.markPromptResolved(state);
       }
 

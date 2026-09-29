@@ -1,15 +1,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { BackgroundWatcher } from "./watcher.js";
 import { PairingStore, type Pairing } from "./pairing.js";
 import type { Terminals } from "./backend/index.js";
-import { BackendUnavailable, type AgentInfo, type AgentStatus } from "./backend/types.js";
+import { BackendUnavailable, type AgentInfo, type AgentStatus, type ScreenSnapshot } from "./backend/types.js";
 import type { MessageHandle, Notifier } from "./notifier.js";
 import type { TurnEngine } from "./turn.js";
 import { encodeCwd } from "./agents/claude/transcript.js";
+import { OMP_RESUME_NOTICE } from "./agents/omp/driver.js";
+import { formatOmpScreenNotice, ompScreenFingerprint } from "./agents/omp/prompts.js";
 
 const PANE = "wG:p1";
 const ORCA_PANE = `orca:${PANE}`;
@@ -30,6 +32,52 @@ function fakeAgent(
     displayId: PANE,
   };
 }
+function fakeOmpAgent(
+  path: string,
+  sessionId: string,
+  cwd: string,
+  device = "1",
+  inode = "1",
+): AgentInfo {
+  const transcriptIdentity = { path, device, inode };
+  return {
+    ...fakeAgent("working", cwd),
+    ref: {
+      target: ORCA_PANE,
+      pid: 42,
+      processStartedAt: 1,
+      agentKind: "omp",
+      sessionId,
+      transcriptIdentity,
+    },
+    backend: "orca",
+    agent: "omp",
+    sessionId,
+    transcriptIdentity,
+    evidence: { kind: "hint", state: "working", waitingSince: null },
+  };
+}
+
+function capturedOmpScreen(filename: string): ScreenSnapshot {
+  const capture = JSON.parse(
+    readFileSync(new URL(`./agents/omp/__fixtures__/${filename}`, import.meta.url), "utf8"),
+  ) as { terminal: Record<string, unknown> };
+  const terminal = capture.terminal;
+  const tail = terminal.tail;
+  const validTail = Array.isArray(tail) && tail.every((row) => typeof row === "string");
+  const rows = Array.isArray(tail) ? tail.filter((row): row is string => typeof row === "string") : [];
+  return {
+    text: rows.join("\n"),
+    draft: typeof terminal.draft === "string" ? terminal.draft : null,
+    complete:
+      validTail &&
+      terminal.source === "screen" &&
+      terminal.status === "running" &&
+      terminal.limited === false &&
+      terminal.truncated === false,
+  };
+}
+
 
 function fakeTerminals(
   agent: (target: string) => AgentInfo | null | Promise<AgentInfo | null> = () => fakeAgent(),
@@ -419,6 +467,158 @@ function appendTurnCompletion(dir: string, name: string): void {
   };
   appendFileSync(join(dir, name), `${JSON.stringify(record)}\n`);
 }
+/** The event envelope matches the captured V4 transcript; poll ordering is synthetic. */
+
+function writeCompletedOmpFixture(dir: string, name: string): void {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, name),
+    readFileSync(new URL("./agents/omp/__fixtures__/transcript-lifecycle.jsonl", import.meta.url), "utf8"),
+  );
+}
+
+function appendOmpStartAndOutput(dir: string, name: string, text: string): void {
+  appendRecords(dir, name, [
+    {
+      type: "message",
+      timestamp: "2026-09-28T22:54:00.000Z",
+      message: { role: "user", content: [{ type: "text", text: "new request" }] },
+    },
+    {
+      type: "message",
+      timestamp: "2026-09-28T22:54:01.000Z",
+      message: { role: "assistant", content: [{ type: "text", text }] },
+    },
+  ]);
+}
+
+function appendOmpCompletion(dir: string, name: string): void {
+  appendRecords(dir, name, [
+    {
+      type: "message",
+      timestamp: "2026-09-28T22:54:02.000Z",
+      message: { role: "assistant", stopReason: "stop", content: [] },
+    },
+  ]);
+}
+
+
+for (const agentKind of ["omp", "claude"] as const) {
+  test(`an Orca ${agentKind} watcher reports a turn started during an incomplete screen read`, {
+    timeout: 10_000,
+  }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), `cctag-orca-watch-incomplete-${agentKind}-`));
+    const cwd = mkdtempSync(join(tmpdir(), "cctag-orca-watch-incomplete-cwd-"));
+    const storeDir = mkdtempSync(join(tmpdir(), "cctag-orca-watch-store-"));
+    const transcriptDir = agentKind === "omp" ? dir : transcriptDirFor(cwd);
+    const transcriptName = "session-a.jsonl";
+    const transcriptPath = join(transcriptDir, transcriptName);
+    const sessionId = "9a51b84e-610c-4d9e-bb20-28d7c850c552";
+    const agent = agentKind === "omp"
+      ? fakeOmpAgent(transcriptPath, sessionId, cwd)
+      : fakeOrcaHintAgent(cwd);
+    let watcher: BackgroundWatcher | undefined;
+    const incompleteScreenRead = deferred();
+    const posted = deferred();
+    let uploadCalls = 0;
+    let startAppended = false;
+    try {
+      if (agentKind === "omp") writeCompletedOmpFixture(transcriptDir, transcriptName);
+      else writeCompletedTurn(transcriptDir, transcriptName, "old watcher history");
+
+      const { notifier, replies } = fakeNotifier((text) => {
+        if (text.includes("new delayed output")) posted.resolve();
+      });
+      const terminals = fakeTerminals(() => agent);
+      terminals.read = async () => {
+        if (startAppended) incompleteScreenRead.resolve();
+        return { text: "partial screen", draft: null, complete: false };
+      };
+      const turnEngine = {
+        ...idleEngine,
+        async uploadOutboxAdditions(...args: Parameters<TurnEngine["uploadOutboxAdditions"]>) {
+          uploadCalls++;
+          return args[2];
+        },
+      } as unknown as TurnEngine;
+      watcher = new BackgroundWatcher(
+        "orca",
+        terminals,
+        storeWithPairing(storeDir, { ...orcaPairing(), cwd }),
+        turnEngine,
+        notifier,
+        20,
+      );
+      watcher.start();
+      await sleep(80); // Establish the EOF baseline beyond the completed history.
+      assert.equal(replies.length, 0, "historical output must not be reported");
+
+      if (agentKind === "omp") appendOmpStartAndOutput(dir, transcriptName, "new delayed output");
+      else appendStartedTurn(transcriptDir, transcriptName, "new delayed output");
+      startAppended = true;
+      await waitForSignal(incompleteScreenRead.promise, "the incomplete start-poll screen");
+      assert.equal(replies.length, 0, "the incomplete start poll must not report");
+
+      if (agentKind === "omp") appendOmpCompletion(dir, transcriptName);
+      else appendTurnCompletion(transcriptDir, transcriptName);
+      await waitForSignal(posted.promise, "the post-baseline completion report");
+      await sleep(80); // Let a later idle poll prove the start flag was consumed.
+
+      assert.equal(replies.filter((reply) => reply.includes("new delayed output")).length, 1);
+      assert.equal(replies.some((reply) => reply.includes("old watcher history")), false);
+      assert.equal(uploadCalls, 1, "the settled turn must be reported only once");
+    } finally {
+      watcher?.stop();
+      rmSync(transcriptDir, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(storeDir, { recursive: true, force: true });
+    }
+  });
+
+  test(`an Orca ${agentKind} watcher ignores historical completion without a new start`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), `cctag-orca-watch-history-${agentKind}-`));
+    const cwd = mkdtempSync(join(tmpdir(), "cctag-orca-watch-history-cwd-"));
+    const storeDir = mkdtempSync(join(tmpdir(), "cctag-orca-watch-store-"));
+    const transcriptDir = agentKind === "omp" ? dir : transcriptDirFor(cwd);
+    const transcriptName = "session-a.jsonl";
+    const transcriptPath = join(transcriptDir, transcriptName);
+    const agent = agentKind === "omp"
+      ? fakeOmpAgent(transcriptPath, "9a51b84e-610c-4d9e-bb20-28d7c850c552", cwd)
+      : fakeOrcaHintAgent(cwd);
+    let watcher: BackgroundWatcher | undefined;
+    try {
+      if (agentKind === "omp") writeCompletedOmpFixture(transcriptDir, transcriptName);
+      else writeCompletedTurn(transcriptDir, transcriptName, "old watcher history");
+
+      const { notifier, replies } = fakeNotifier();
+      const terminals = fakeTerminals(() => agent);
+      const turnEngine = fakeOrcaTurnEngine();
+      watcher = new BackgroundWatcher(
+        "orca",
+        terminals,
+        storeWithPairing(storeDir, { ...orcaPairing(), cwd }),
+        turnEngine,
+        notifier,
+        20,
+      );
+      watcher.start();
+      await sleep(100);
+      watcher.stop();
+
+      assert.deepEqual(replies, [], "a baseline completion without a post-baseline start is inactive");
+    } finally {
+      watcher?.stop();
+      rmSync(transcriptDir, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(storeDir, { recursive: true, force: true });
+    }
+  });
+}
+
+
+
 
 /** A pane reporting no session id, whose status the test can flip. */
 function rotatingTerminals(cwd: string, status: () => AgentStatus): Terminals {
@@ -1750,6 +1950,254 @@ function uploadRecordingEngine(): { engine: TurnEngine; handovers: string[][] } 
   } as unknown as TurnEngine;
   return { engine, handovers };
 }
+test("an OMP transcript read is discarded when its process binding is lost", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cctag-omp-watch-loss-"));
+  let watcher: BackgroundWatcher | undefined;
+  try {
+    const cwd = join(dir, "cwd");
+    mkdirSync(cwd);
+    const transcriptPath = join(dir, "omp-session.jsonl");
+    writeFileSync(transcriptPath, "");
+    const sessionId = "9a51b84e-610c-4d9e-bb20-28d7c850c552";
+    const agent = fakeOmpAgent(transcriptPath, sessionId, cwd);
+    const pairing = { ...orcaPairing(), cwd };
+    const store = new PairingStore(join(dir, "pairings.json"));
+    store.add(pairing);
+    const { notifier, replies } = fakeNotifier();
+    let gets = 0;
+    const terminals = fakeTerminals(
+      () => {
+        gets++;
+        return gets <= 2 ? agent : null;
+      },
+      () => true,
+    );
+    watcher = new BackgroundWatcher("orca", terminals, store, idleEngine, notifier, 160);
+    watcher.start();
+    await sleep(210); // let the first tick establish its baseline
+    assert.equal(gets, 1);
+
+    appendRecords(dir, "omp-session.jsonl", [
+      {
+        type: "message",
+        timestamp: "2026-09-28T22:53:55.000Z",
+        message: { role: "assistant", content: [{ type: "text", text: "must not be posted" }] },
+      },
+    ]);
+    await sleep(300);
+    watcher.stop();
+
+    assert.ok(gets >= 3, "the read must be followed by an ownership lookup");
+    assert.equal(replies.filter((reply) => reply === OMP_RESUME_NOTICE).length, 1);
+    assert.equal(replies.some((reply) => reply.includes("must not be posted")), false);
+    assert.equal(store.list().length, 1, "binding loss does not discard the pairing");
+  } finally {
+    watcher?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("watcher waits for two complete OMP screens before handing off a terminal-only notice", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cctag-omp-watch-screen-"));
+  let watcher: BackgroundWatcher | undefined;
+  try {
+    const cwd = join(dir, "cwd");
+    mkdirSync(cwd);
+    const transcriptPath = join(dir, "omp-session.jsonl");
+    writeFileSync(transcriptPath, "");
+    const sessionId = "9a51b84e-610c-4d9e-bb20-28d7c850c552";
+    const agent = fakeOmpAgent(transcriptPath, sessionId, cwd);
+    const pairing = { ...orcaPairing(), cwd };
+    const store = new PairingStore(join(dir, "pairings.json"));
+    store.add(pairing);
+    const waiting = capturedOmpScreen("ask-open.screen.json");
+    const expectedNotice = formatOmpScreenNotice(waiting);
+    const expectedFingerprint = ompScreenFingerprint(waiting);
+    assert.ok(expectedNotice);
+    assert.ok(expectedFingerprint);
+    const terminals = fakeTerminals(() => agent);
+    terminals.read = async () => waiting;
+    const handoffs: Array<Parameters<TurnEngine["adoptBlockedTerminal"]>[1]> = [];
+    const engine = {
+      isBusy: () => false,
+      async adoptBlockedTerminal(_pairing: Pairing, handoff: (typeof handoffs)[number]) {
+        handoffs.push(handoff);
+        return true;
+      },
+    } as unknown as TurnEngine;
+    const { notifier } = fakeNotifier();
+    watcher = new BackgroundWatcher("orca", terminals, store, engine, notifier, 20);
+    watcher.start();
+    await sleep(45); // establish the transcript baseline before adding a new turn
+    appendRecords(dir, "omp-session.jsonl", [
+      {
+        type: "message",
+        timestamp: "2026-09-28T22:53:55.000Z",
+        message: { role: "user", content: [{ type: "text", text: "new request" }] },
+      },
+    ]);
+    for (let i = 0; i < 40 && handoffs.length === 0; i++) await sleep(5);
+    watcher.stop();
+
+    assert.equal(handoffs.length, 1);
+    assert.equal(handoffs[0]!.ompStatus?.waitingSamples, 2);
+    assert.equal(handoffs[0]!.ompStatus?.noticeFingerprint, null);
+    assert.equal(handoffs[0]!.ompNotice, expectedNotice);
+    assert.equal(handoffs[0]!.ompFingerprint, expectedFingerprint);
+  } finally {
+    watcher?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an established OMP session switch baselines at EOF without replaying history", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cctag-omp-watch-switch-"));
+  let watcher: BackgroundWatcher | undefined;
+  try {
+    const cwd = join(dir, "cwd");
+    mkdirSync(cwd);
+    const firstPath = join(dir, "omp-first.jsonl");
+    const secondPath = join(dir, "omp-second.jsonl");
+    writeFileSync(firstPath, "");
+    const firstId = "9a51b84e-610c-4d9e-bb20-28d7c850c552";
+    const secondId = "291665fa-c79d-4ddb-a952-c2f947fa6d88";
+    let current = fakeOmpAgent(firstPath, firstId, cwd, "1", "11");
+    const store = new PairingStore(join(dir, "pairings.json"));
+    const pairing = { ...orcaPairing(), cwd };
+    store.add(pairing);
+    const { notifier, replies } = fakeNotifier();
+    const { engine } = uploadRecordingEngine();
+    const terminals = fakeTerminals(() => current);
+    terminals.read = async () => capturedOmpScreen("idle.screen.json");
+    watcher = new BackgroundWatcher("orca", terminals, store, engine, notifier, 50);
+    watcher.start();
+    await sleep(80);
+
+    appendRecords(dir, "omp-second.jsonl", [
+      {
+        type: "message",
+        timestamp: "2026-09-28T22:53:54.000Z",
+        message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "stale history" }] },
+      },
+    ]);
+    current = fakeOmpAgent(secondPath, secondId, cwd, "1", "22");
+    await sleep(80); // the changed file is established at its current EOF
+    assert.equal(store.list().length, 1);
+    assert.equal(replies.some((reply) => reply.includes("stale history")), false);
+
+    appendRecords(dir, "omp-second.jsonl", [
+      {
+        type: "message",
+        timestamp: "2026-09-28T22:54:00.000Z",
+        message: { role: "user", content: [{ type: "text", text: "new request" }] },
+      },
+      {
+        type: "message",
+        timestamp: "2026-09-28T22:54:01.000Z",
+        message: { role: "assistant", content: [{ type: "text", text: "fresh session output" }] },
+      },
+    ]);
+    await sleep(80);
+    appendRecords(dir, "omp-second.jsonl", [
+      {
+        type: "message",
+        timestamp: "2026-09-28T22:54:02.000Z",
+        message: { role: "assistant", stopReason: "stop", content: [] },
+      },
+    ]);
+    for (let i = 0; i < 30 && !replies.some((reply) => reply.includes("fresh session output")); i++) {
+      await sleep(20);
+    }
+    watcher.stop();
+
+    assert.equal(store.list().length, 1, "session rotation keeps its pane pairing");
+    assert.equal(replies.some((reply) => reply.includes("stale history")), false);
+    assert.equal(
+      replies.filter((reply) => reply.includes("fresh session output")).length,
+      1,
+    );
+  } finally {
+    watcher?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+
+test("an OMP inode replacement discards the read batch and rebaselines at the replacement EOF", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cctag-omp-watch-inode-"));
+  let watcher: BackgroundWatcher | undefined;
+  try {
+    const cwd = join(dir, "cwd");
+    mkdirSync(cwd);
+    const transcriptPath = join(dir, "omp-session.jsonl");
+    writeFileSync(transcriptPath, "");
+    const sessionId = "9a51b84e-610c-4d9e-bb20-28d7c850c552";
+    const oldAgent = fakeOmpAgent(transcriptPath, sessionId, cwd, "1", "11");
+    const replacement = fakeOmpAgent(transcriptPath, sessionId, cwd, "1", "22");
+    const pairing = { ...orcaPairing(), cwd };
+    const store = new PairingStore(join(dir, "pairings.json"));
+    store.add(pairing);
+    const { notifier, replies } = fakeNotifier();
+    let gets = 0;
+    const terminals = fakeTerminals(
+      () => {
+        gets++;
+        return gets <= 2 ? oldAgent : replacement;
+      },
+      () => true,
+    );
+    terminals.read = async () => capturedOmpScreen("idle.screen.json");
+    const { engine } = uploadRecordingEngine();
+    watcher = new BackgroundWatcher("orca", terminals, store, engine, notifier, 50);
+    watcher.start();
+    await sleep(80);
+
+    renameSync(transcriptPath, join(dir, "omp-session-old-inode.jsonl"));
+    appendRecords(dir, "omp-session.jsonl", [
+      {
+        type: "message",
+        timestamp: "2026-09-28T22:54:10.000Z",
+        message: { role: "assistant", content: [{ type: "text", text: "replaced transcript history" }] },
+      },
+    ]);
+    await sleep(80); // read the replacement, then reject it when its inode differs
+    assert.equal(replies.some((reply) => reply.includes("replaced transcript history")), false);
+    assert.equal(replies.includes(OMP_RESUME_NOTICE), false, "a new valid inode is a switch, not a quit");
+    assert.equal(store.list().length, 1);
+
+    appendRecords(dir, "omp-session.jsonl", [
+      {
+        type: "message",
+        timestamp: "2026-09-28T22:54:11.000Z",
+        message: { role: "user", content: [{ type: "text", text: "new request" }] },
+      },
+      {
+        type: "message",
+        timestamp: "2026-09-28T22:54:12.000Z",
+        message: { role: "assistant", content: [{ type: "text", text: "replacement output" }] },
+      },
+    ]);
+    await sleep(80);
+    appendRecords(dir, "omp-session.jsonl", [
+      {
+        type: "message",
+        timestamp: "2026-09-28T22:54:13.000Z",
+        message: { role: "assistant", stopReason: "stop", content: [] },
+      },
+    ]);
+    for (let i = 0; i < 30 && !replies.some((reply) => reply.includes("replacement output")); i++) {
+      await sleep(20);
+    }
+    watcher.stop();
+
+    assert.equal(replies.some((reply) => reply.includes("replaced transcript history")), false);
+    assert.equal(replies.filter((reply) => reply.includes("replacement output")).length, 1);
+    assert.equal(store.list().length, 1);
+  } finally {
+    watcher?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test("Orca hint working-to-idle transition posts terminal output and file additions", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "cctag-orca-watch-"));

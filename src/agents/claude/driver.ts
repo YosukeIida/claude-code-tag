@@ -306,13 +306,13 @@ export const claudeDriver: AgentDriver = {
       const name = basename(executable ?? "");
       return name === "claude" || (name === "node" && args.some((arg) => arg.includes("@anthropic-ai/claude-code")));
     },
-    async sessionId(pid, access) {
-      const path = join(access.homeDir, ".claude", "sessions", `${pid}.json`);
+    async session(process, access) {
+      const path = join(access.homeDir, ".claude", "sessions", `${process.pid}.json`);
       const session = JSON.parse(await access.readFile(path)) as { sessionId?: unknown };
       if (typeof session.sessionId !== "string" || session.sessionId.length === 0) {
         throw new Error("Claude session id is missing");
       }
-      return session.sessionId;
+      return { sessionId: session.sessionId };
     },
   },
 

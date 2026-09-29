@@ -1,10 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { claudeDriver } from "../agents/claude/driver.js";
+import { OMP_RESUME_NOTICE, ompDriver } from "../agents/omp/driver.js";
 import type { SubmitContext } from "./index.js";
 import type { OrcaRuntime, OrcaExecResult } from "./orca.js";
-import { OrcaBackend } from "./orca.js";
+import { createOrcaRuntime, OrcaBackend } from "./orca.js";
 import {
   BackendUnavailable,
   ExpectationLost,
@@ -27,6 +30,7 @@ interface ProcessFixture {
   paneKey?: string;
   terminalHandle?: string;
   cwd?: string;
+  piCodingAgentDir?: string;
 }
 
 interface CapturedProcess extends ProcessFixture {
@@ -65,6 +69,8 @@ const terminalListCapture = readJsonFixture("./__fixtures__/orca/terminal-list-q
 const terminalShowCapture = readJsonFixture("./__fixtures__/orca/terminal-show-question-state.json");
 const terminalReadCapture = readJsonFixture("./__fixtures__/orca/terminal-read-question-state.json");
 const terminalSendCapture = readJsonFixture("./__fixtures__/orca/terminal-send-receipt.json");
+const ompTerminalSendCapture = readJsonFixture("./__fixtures__/orca/omp/terminal-send-unsupported.json");
+const ompSingleOpenerCapture = readJsonFixture("./__fixtures__/orca/omp/single-opener-lsof.json");
 const hooksStatusCapture = readJsonFixture("./__fixtures__/orca/agent-hooks-status.json");
 const staleShowCapture = readJsonFixture("./__fixtures__/orca/terminal-show-stale-error.json");
 const transitions = readJsonFixture("./__fixtures__/orca/claude-session-transitions.json") as {
@@ -82,7 +88,17 @@ const worktreeQuestionAgent = objectRows(worktreePsResult.worktrees)
 if (!worktreeQuestionAgent) throw new Error("worktree-ps capture has no waiting question agent");
 const capturedReadTerminal = object(responseResult(terminalReadCapture).terminal) ?? {};
 const capturedSendResult = responseResult(terminalSendCapture);
+const capturedOmpSendResult = responseResult(ompTerminalSendCapture);
 const capturedHooksResult = responseResult(hooksStatusCapture);
+function withSendStages(templateResult: JsonObject, stages: readonly string[], accepted = true): JsonObject {
+  const send = object(templateResult.send);
+  const prompt = object(send?.prompt);
+  if (!send || !prompt) throw new Error("captured Orca send result has no send prompt");
+  return {
+    ...templateResult,
+    send: { ...send, accepted, prompt: { ...prompt, stages: [...stages] } },
+  };
+}
 const PANE = "<tab-B>:<leaf-B>";
 const HANDLE = "<terminal-B>";
 const TARGET = `orca:${PANE}`;
@@ -144,10 +160,15 @@ class FakeOrcaRuntime implements OrcaRuntime {
   readonly calls: Array<{ file: string; args: string[]; timeoutMs: number }> = [];
   readonly readPaths: string[] = [];
   readonly sessionFiles = new Map<string, string>();
+  readonly transcriptHeads = new Map<string, string>();
+  readonly descriptorOutputs = new Map<number, string>();
+  readonly openerOutputs = new Map<string, string>();
+  readonly statOutputs = new Map<string, string>();
   readonly staleHandles = new Set<string>();
   readonly sendCalls: Array<{ args: string[]; timeoutMs: number }> = [];
   acceptedInputWrites = 0;
   sendReceipt: JsonObject = { ...capturedSendResult };
+  sendEnvelopeCapture: JsonObject = terminalSendCapture;
   sendFailure: OrcaExecResult | null = null;
   sendFailureAfterAccept = false;
   afterSend: (() => void) | null = null;
@@ -189,16 +210,44 @@ class FakeOrcaRuntime implements OrcaRuntime {
     this.screen = { ...capturedReadTerminal };
     this.sendReceipt = { ...capturedSendResult };
     this.setSession(process.pid, { sessionId: "<session-A>" });
+    this.sendEnvelopeCapture = terminalSendCapture;
   }
 
   setSession(pid: number, session: Record<string, unknown>): void {
     this.sessionFiles.set(SESSION_PATH(pid), JSON.stringify(session));
   }
+  setOmpBinding(
+    pid: number,
+    path: string,
+    cwd: string,
+    sessionId: string,
+    writerFixture: OmpWriterFixture = "v7-main-writer-fields.lsof",
+    transcriptFixture: OmpTranscriptFixture = "v4-new-session-head.jsonl",
+  ): void {
+    const writer = capturedOmpWriter(pid, path, writerFixture);
+    this.descriptorOutputs.set(pid, writer.output);
+    this.statOutputs.set(path, `${writer.device} ${writer.inode}\n`);
+    this.openerOutputs.set(path, capturedOmpOpener(pid, path));
+    this.sendEnvelopeCapture = ompTerminalSendCapture;
+    this.sendReceipt = { ...capturedOmpSendResult };
+    const records = capturedOmpTranscriptHead(transcriptFixture).split(/\r?\n/u);
+    const session = JSON.parse(records[1]!) as JsonObject;
+    session.id = sessionId;
+    session.cwd = cwd;
+    records[1] = JSON.stringify(session);
+    this.transcriptHeads.set(path, records.join("\n"));
+  }
+
 
   async readFile(path: string): Promise<string> {
     this.readPaths.push(path);
     const content = this.sessionFiles.get(path);
     if (content === undefined) throw new Error("fake session file is missing");
+    return content;
+  }
+  async readTranscriptHead(path: string): Promise<string> {
+    const content = this.transcriptHeads.get(path);
+    if (content === undefined) throw new Error("fake transcript head is missing");
     return content;
   }
 
@@ -215,6 +264,7 @@ class FakeOrcaRuntime implements OrcaRuntime {
             const environment = [
               row.paneKey ? `ORCA_PANE_KEY=${row.paneKey}` : "",
               row.terminalHandle ? `ORCA_TERMINAL_HANDLE=${row.terminalHandle}` : "",
+              row.piCodingAgentDir !== undefined ? `PI_CODING_AGENT_DIR=${row.piCodingAgentDir}` : "",
             ]
               .filter(Boolean)
               .join(" ");
@@ -225,6 +275,13 @@ class FakeOrcaRuntime implements OrcaRuntime {
       }
     }
     if (file === "lsof") {
+      if (args.includes("-FftpaDin")) {
+        const pid = Number(args[args.indexOf("-p") + 1]);
+        return { stdout: this.descriptorOutputs.get(pid) ?? "", stderr: "", exitCode: 0 };
+      }
+      if (args[0] === "-Fpa") {
+        return { stdout: this.openerOutputs.get(args[1] ?? "") ?? "", stderr: "", exitCode: 0 };
+      }
       const pidArg = args[args.indexOf("-p") + 1] ?? "";
       const pids = new Set(pidArg.split(",").map(Number));
       const stdout = this.processes
@@ -232,6 +289,10 @@ class FakeOrcaRuntime implements OrcaRuntime {
         .map((row) => `p${row.pid}\nfcwd\nn${row.cwd}`)
         .join("\n");
       return { stdout, stderr: "", exitCode: 0 };
+    }
+    if (file === "stat") {
+      const path = args.at(-1) ?? "";
+      return { stdout: this.statOutputs.get(path) ?? "", stderr: "", exitCode: 0 };
     }
     if (file !== this.bin) throw new Error(`unexpected fake command: ${file}`);
 
@@ -296,7 +357,8 @@ class FakeOrcaRuntime implements OrcaRuntime {
         }
         return this.sendFailure;
       }
-      const capturedSend = object(capturedSendResult.send) ?? {};
+      const sendTemplateResult = responseResult(this.sendEnvelopeCapture);
+      const capturedSend = object(sendTemplateResult.send) ?? {};
       const overrideSend = object(this.sendReceipt.send) ?? {};
       const send: JsonObject = {
         ...capturedSend,
@@ -307,18 +369,18 @@ class FakeOrcaRuntime implements OrcaRuntime {
         },
       };
       const result = {
-        ...capturedSendResult,
+        ...sendTemplateResult,
         ...this.sendReceipt,
         send,
         mutation: {
-          ...(object(capturedSendResult.mutation) ?? {}),
+          ...(object(sendTemplateResult.mutation) ?? {}),
           ...(object(this.sendReceipt.mutation) ?? {}),
         },
       };
       const accepted = send.accepted === true;
       if (accepted) this.acceptedInputWrites++;
       this.afterSend?.();
-      return successResponse(terminalSendCapture, result);
+      return successResponse(this.sendEnvelopeCapture, result);
     }
     if (args[0] === "terminal" && args[1] === "read") {
       const handle = args[args.indexOf("--terminal") + 1] ?? "";
@@ -336,6 +398,101 @@ class FakeOrcaRuntime implements OrcaRuntime {
 function backend(runtime: FakeOrcaRuntime): OrcaBackend {
   return new OrcaBackend(runtime.bin, runtime);
 }
+const OMP_SESSION_ID = "9a51b84e-610c-4d9e-bb20-28d7c850c552";
+const OMP_CWD = "/workspace-omp";
+const OMP_TRANSCRIPT =
+  `/fake-home/.omp/profiles/team/agent/sessions/2026-09-28T22-53-54-622Z_${OMP_SESSION_ID}.jsonl`;
+const OMP_PANE = "omp-tab:omp-leaf";
+const OMP_HANDLE = "omp-terminal";
+type OmpWriterFixture = "v7-main-writer-fields.lsof" | "v7-session-dir-writer-fields.lsof";
+type OmpTranscriptFixture =
+  | "v4-new-session-head.jsonl"
+  | "v4-first-session-final-head.jsonl"
+  | "v4-session-head.jsonl";
+const OMP_LSOF_DEVICE_HEX = "0x1000012";
+const OMP_LSOF_DEVICE_DECIMAL = BigInt(OMP_LSOF_DEVICE_HEX).toString(10);
+
+function capturedOmpWriter(pid: number, path: string, fixture: OmpWriterFixture): {
+  output: string;
+  device: string;
+  inode: string;
+} {
+  const source = readFileSync(new URL(`./__fixtures__/orca/omp/${fixture}`, import.meta.url), "utf8").trimEnd();
+  const inode = source.match(/^i(\d+)$/mu)?.[1];
+  if (!inode) throw new Error(`captured OMP writer fixture has no inode: ${fixture}`);
+  // The V7 raw blocks omit lsof D and stat samples; this synthetic D exercises hex normalization only.
+  const fields = source
+    .replace(/^tREG$/mu, `tREG\nD${OMP_LSOF_DEVICE_HEX}`)
+    .replace(/^n.*$/mu, `n${path}`);
+  return {
+    output: `p${pid}\n${fields}`,
+    device: OMP_LSOF_DEVICE_DECIMAL,
+    inode,
+  };
+}
+function capturedOmpOpener(pid: number, path: string, access: "r" | "w" = "w"): string {
+  const raw = ompSingleOpenerCapture.fdOutput;
+  if (typeof raw !== "string" || !raw.includes("aw")) {
+    throw new Error("captured OMP opener fixture has no raw write-access block");
+  }
+  return raw
+    .replace("<pid-V7-A>", String(pid))
+    .replace(/^aw$/mu, `a${access}`)
+    .replace(/^n.*$/mu, `n${path}`);
+}
+function replaceOmpLsofDevice(runtime: FakeOrcaRuntime, pid: number, value: string): void {
+  const descriptors = runtime.descriptorOutputs.get(pid);
+  if (descriptors === undefined) throw new Error(`fake OMP process has no descriptor output: ${pid}`);
+  const updated = descriptors.replace(/^D.*$/mu, `D${value}`);
+  if (updated === descriptors) throw new Error(`fake OMP process has no device field: ${pid}`);
+  runtime.descriptorOutputs.set(pid, updated);
+}
+// These files preserve the first two V4 JSONL records with title/session values redacted.
+function capturedOmpTranscriptHead(fixture: OmpTranscriptFixture): string {
+  return readFileSync(new URL(`./__fixtures__/orca/omp/${fixture}`, import.meta.url), "utf8").replace(/\r?\n$/u, "");
+}
+
+
+
+function installOmpProcess(
+  runtime: FakeOrcaRuntime,
+  options: {
+    pid?: number;
+    command?: string;
+    paneKey?: string;
+    terminalHandle?: string;
+    cwd?: string;
+    sessionId?: string;
+    path?: string;
+    writerFixture?: OmpWriterFixture;
+    transcriptFixture?: OmpTranscriptFixture;
+  } = {},
+): ProcessFixture {
+  const pid = options.pid ?? 40303;
+  const cwd = options.cwd ?? OMP_CWD;
+  const sessionId = options.sessionId ?? OMP_SESSION_ID;
+  const path = options.path ?? OMP_TRANSCRIPT;
+  const process: ProcessFixture = {
+    pid,
+    ppid: 1,
+    pgid: pid,
+    tpgid: pid,
+    tty: "ttys007",
+    lstart: "Mon Sep 28 20:33:00 2026",
+    command: options.command ?? "omp --profile team",
+    paneKey: options.paneKey ?? OMP_PANE,
+    terminalHandle: options.terminalHandle ?? OMP_HANDLE,
+    cwd,
+  };
+  runtime.processes = [process];
+  runtime.terminals = [
+    terminalFor(process.paneKey!, process.terminalHandle!, { title: "OMP terminal" }),
+  ];
+  runtime.worktreeAgentsOverride = [];
+  runtime.setOmpBinding(pid, path, cwd, sessionId, options.writerFixture, options.transcriptFixture);
+  return process;
+}
+
 
 function currentRef(row: ProcessFixture = capture.process): AgentRef {
   return {
@@ -348,6 +505,13 @@ function currentRef(row: ProcessFixture = capture.process): AgentRef {
 function capturedClaudeScreen(name: string): JsonObject {
   const fixture = JSON.parse(
     readFileSync(new URL(`../agents/claude/__fixtures__/${name}`, import.meta.url), "utf8"),
+  ) as { terminal: JsonObject };
+  return fixture.terminal;
+}
+
+function capturedOmpScreen(name: string): JsonObject {
+  const fixture = JSON.parse(
+    readFileSync(new URL(`../agents/omp/__fixtures__/${name}`, import.meta.url), "utf8"),
   ) as { terminal: JsonObject };
   return fixture.terminal;
 }
@@ -429,6 +593,474 @@ test("discovers the Claude process and joins terminal, worktree state, cwd, and 
   assert.deepEqual(runtime.readPaths, [SESSION_PATH(capture.process.pid)]);
   assert.ok(runtime.calls.every((call) => call.timeoutMs === 5_000));
 });
+test("lists OMP only with its verified transcript binding and preserves process identity", async () => {
+  const runtime = new FakeOrcaRuntime();
+  const process = installOmpProcess(runtime);
+  const terminals = backend(runtime);
+  const result = await terminals.list();
+
+  assert.equal(result.complete, true);
+  assert.deepEqual(result.notices, []);
+  assert.equal(result.agents.length, 1);
+  const agent = result.agents[0]!;
+  assert.equal(agent.agent, "omp");
+  assert.equal(agent.ref.target, `orca:${OMP_PANE}`);
+  assert.equal(agent.ref.agentKind, "omp");
+  assert.equal(agent.sessionId, OMP_SESSION_ID);
+  assert.deepEqual(agent.transcriptIdentity, {
+    path: OMP_TRANSCRIPT,
+    device: "16777234",
+    inode: "13090808",
+  });
+  assert.equal(agent.cwd, process.cwd);
+  assert.equal((await terminals.get(agent.ref.target))?.agent, "omp");
+  assert.equal(await terminals.sameProcess(agent.ref), true);
+  assert.ok(
+    runtime.calls.some(({ file, args }) => file === "lsof" && args.includes("-FftpaDin")),
+    "requests lsof's hexadecimal device-number field",
+  );
+  runtime.statOutputs.set(OMP_TRANSCRIPT, "16777234 93002\n");
+  assert.equal(await terminals.sameProcess(agent.ref), false, "same PID and pane do not excuse an inode change");
+});
+test("OMP lsof device numbers reject malformed and unsafe values but accept the safe limit", async () => {
+  const maximumSafe = BigInt(Number.MAX_SAFE_INTEGER);
+  const maximumSafeHex = `0X${maximumSafe.toString(16).toUpperCase()}`;
+  const maximumSafeDevice = maximumSafe.toString(10);
+  const aboveSafe = maximumSafe + 1n;
+  const aboveSafeHex = `0x${aboveSafe.toString(16)}`;
+  const aboveSafeDevice = aboveSafe.toString(10);
+
+  const atLimitRuntime = new FakeOrcaRuntime();
+  const atLimitProcess = installOmpProcess(atLimitRuntime);
+  replaceOmpLsofDevice(atLimitRuntime, atLimitProcess.pid, maximumSafeHex);
+  atLimitRuntime.statOutputs.set(OMP_TRANSCRIPT, `${maximumSafeDevice} 13090808\n`);
+  const atLimit = await backend(atLimitRuntime).list();
+  assert.equal(atLimit.agents.length, 1, "Number.MAX_SAFE_INTEGER remains a valid device");
+  assert.equal(atLimit.agents[0]?.transcriptIdentity?.device, maximumSafeDevice);
+
+  const invalidDevices = [
+    { name: "no hex digits", value: "0x" },
+    { name: "non-hex characters", value: "0x12g" },
+    { name: "empty D value", value: "" },
+    { name: "missing hexadecimal prefix", value: "1000012" },
+    { name: "one above Number.MAX_SAFE_INTEGER", value: aboveSafeHex, statDevice: aboveSafeDevice },
+  ];
+  for (const invalid of invalidDevices) {
+    const runtime = new FakeOrcaRuntime();
+    const process = installOmpProcess(runtime);
+    replaceOmpLsofDevice(runtime, process.pid, invalid.value);
+    if (invalid.statDevice) runtime.statOutputs.set(OMP_TRANSCRIPT, `${invalid.statDevice} 13090808\n`);
+    const result = await backend(runtime).list();
+    assert.deepEqual(result.agents, [], invalid.name);
+    assert.ok(result.notices.includes(OMP_RESUME_NOTICE), invalid.name);
+  }
+});
+
+test("OMP binds from each captured V4 title-prefaced session header", async () => {
+  const fixtures: OmpTranscriptFixture[] = [
+    "v4-new-session-head.jsonl",
+    "v4-first-session-final-head.jsonl",
+    "v4-session-head.jsonl",
+  ];
+  for (const transcriptFixture of fixtures) {
+    const runtime = new FakeOrcaRuntime();
+    installOmpProcess(runtime, { transcriptFixture });
+    const result = await backend(runtime).list();
+    assert.equal(result.agents[0]?.sessionId, OMP_SESSION_ID, transcriptFixture);
+  }
+});
+
+test("OMP refuses missing, malformed, and conflicting first session records", async () => {
+  const capturedHead = capturedOmpTranscriptHead("v4-new-session-head.jsonl").split(/\r?\n/u);
+  const [title, sessionLine] = capturedHead;
+  if (!title || !sessionLine) throw new Error("captured V4 head is incomplete");
+  const conflictingSession = JSON.parse(sessionLine) as JsonObject;
+  conflictingSession.cwd = "/other";
+  const invalidHeads: Array<[string, string]> = [
+    [
+      "no session record",
+      `${JSON.stringify({ type: "title" })}\n${JSON.stringify({ type: "model_change" })}`,
+    ],
+    ["malformed prefix", `{"type":\n${capturedHead.join("\n")}`],
+    [
+      "first session record mismatches despite a later matching record",
+      `${title}\n${JSON.stringify(conflictingSession)}\n${sessionLine}`,
+    ],
+  ];
+  for (const [name, head] of invalidHeads) {
+    const runtime = new FakeOrcaRuntime();
+    installOmpProcess(runtime);
+    runtime.transcriptHeads.set(OMP_TRANSCRIPT, head);
+    const result = await backend(runtime).list();
+    assert.deepEqual(result.agents, [], name);
+    assert.ok(result.notices.includes(OMP_RESUME_NOTICE), name);
+  }
+});
+
+test("native transcript head is bounded by 16 lines and 64 KiB", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "cctag-omp-head-"));
+  try {
+    const runtime = createOrcaRuntime();
+    const session = JSON.stringify({ type: "session", version: 3, id: OMP_SESSION_ID, cwd: OMP_CWD });
+    const lineBoundPath = join(directory, "line-bound.jsonl");
+    const firstSixteen = Array.from({ length: 16 }, () => JSON.stringify({ type: "title", v: 1 })).join("\n");
+    writeFileSync(lineBoundPath, `${firstSixteen}\n${session}\n`);
+    const lineBound = await runtime.readTranscriptHead(lineBoundPath);
+    assert.equal((lineBound.match(/\n/gu) ?? []).length, 16);
+    assert.equal(lineBound.includes('"type":"session"'), false);
+
+    const byteBoundPath = join(directory, "byte-bound.jsonl");
+    const oversizedTitle = JSON.stringify({ type: "title", pad: "x".repeat(64 * 1024) });
+    writeFileSync(byteBoundPath, `${oversizedTitle}\n${session}\n`);
+    const byteBound = await runtime.readTranscriptHead(byteBoundPath);
+    assert.equal(Buffer.byteLength(byteBound, "utf8"), 64 * 1024);
+    assert.equal(byteBound.includes('"type":"session"'), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("lists OMP from the captured V7 opener block beside Claude", async () => {
+  const runtime = new FakeOrcaRuntime();
+  const claude = runtime.processes[0]!;
+  const claudeTerminal = runtime.terminals[0]!;
+  const omp = installOmpProcess(runtime);
+  runtime.processes = [claude, omp];
+  runtime.terminals = [claudeTerminal, ...runtime.terminals];
+
+  const agents = (await backend(runtime).list()).agents;
+  assert.deepEqual(
+    agents.map(({ agent }) => agent).sort(),
+    ["claude", "omp"],
+  );
+  const ompAgent = agents.find(({ agent }) => agent === "omp");
+  assert.ok(ompAgent);
+  assert.equal(ompAgent.ref.pid, omp.pid);
+  assert.equal(ompAgent.sessionId, OMP_SESSION_ID);
+  assert.equal(ompAgent.transcriptIdentity?.path, OMP_TRANSCRIPT);
+  assert.notEqual(agents[0]!.ref.target, agents[1]!.ref.target);
+});
+
+test("OMP discovery fails closed on missing, ambiguous, replaced, or mismatched transcript evidence", async () => {
+  const invalidEvidence: Array<{
+    name: string;
+    mutate(runtime: FakeOrcaRuntime, process: ProcessFixture): void;
+  }> = [
+    {
+      name: "zero writer descriptors",
+      mutate: (runtime, process) => runtime.descriptorOutputs.set(process.pid, `p${process.pid}\n`),
+    },
+    {
+      name: "missing lsof device number",
+      mutate: (runtime, process) => {
+        const descriptors = runtime.descriptorOutputs.get(process.pid) ?? "";
+        runtime.descriptorOutputs.set(
+          process.pid,
+          descriptors
+            .split(/\r?\n/u)
+            .filter((line) => !line.startsWith("D"))
+            .join("\n"),
+        );
+      },
+    },
+    {
+      name: "two writer descriptors",
+      mutate: (runtime, process) => {
+        const secondWriter = capturedOmpWriter(
+          process.pid,
+          OMP_TRANSCRIPT,
+          "v7-session-dir-writer-fields.lsof",
+        );
+        runtime.descriptorOutputs.set(
+          process.pid,
+          `${runtime.descriptorOutputs.get(process.pid)}\n${secondWriter.output}`,
+        );
+      },
+    },
+    {
+      name: "device/inode mismatch",
+      mutate: (runtime) => runtime.statOutputs.set(OMP_TRANSCRIPT, "16777234 93002\n"),
+    },
+    {
+      name: "another process writes the transcript",
+      mutate: (runtime, process) =>
+        runtime.openerOutputs.set(
+          OMP_TRANSCRIPT,
+          `${capturedOmpOpener(process.pid, OMP_TRANSCRIPT)}\n${capturedOmpOpener(49999, OMP_TRANSCRIPT)}`,
+        ),
+    },
+    {
+      name: "session id mismatch",
+      mutate: (runtime) =>
+        runtime.transcriptHeads.set(
+          OMP_TRANSCRIPT,
+          JSON.stringify({ type: "session", version: 3, id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", cwd: OMP_CWD }),
+        ),
+    },
+    {
+      name: "session cwd mismatch",
+      mutate: (runtime) =>
+        runtime.transcriptHeads.set(
+          OMP_TRANSCRIPT,
+          JSON.stringify({ type: "session", version: 3, id: OMP_SESSION_ID, cwd: "/other" }),
+        ),
+    },
+    {
+      name: "session record is not v3",
+      mutate: (runtime) =>
+        runtime.transcriptHeads.set(
+          OMP_TRANSCRIPT,
+          JSON.stringify({ type: "session", version: 2, id: OMP_SESSION_ID, cwd: OMP_CWD }),
+        ),
+    },
+  ];
+
+  for (const evidence of invalidEvidence) {
+    const runtime = new FakeOrcaRuntime();
+    const process = installOmpProcess(runtime);
+    evidence.mutate(runtime, process);
+    const result = await backend(runtime).list();
+    assert.deepEqual(result.agents, [], evidence.name);
+    assert.ok(result.notices.includes(OMP_RESUME_NOTICE), evidence.name);
+  }
+});
+
+test("OMP accepts read-only transcript observers and enforces explicit session directory boundaries", async () => {
+  const observerRuntime = new FakeOrcaRuntime();
+  const observer = installOmpProcess(observerRuntime);
+  observerRuntime.openerOutputs.set(
+    OMP_TRANSCRIPT,
+    `${capturedOmpOpener(observer.pid, OMP_TRANSCRIPT)}\n${capturedOmpOpener(49999, OMP_TRANSCRIPT, "r")}`,
+  );
+  assert.equal((await backend(observerRuntime).list()).agents[0]?.agent, "omp");
+
+  const directory = "/tmp/cctag-omp-sessions";
+  const filename = `2026-09-28T22-53-54-622Z_${OMP_SESSION_ID}.jsonl`;
+  const path = `${directory}/${filename}`;
+  const explicitRuntime = new FakeOrcaRuntime();
+  installOmpProcess(explicitRuntime, {
+    command: `omp --session-dir ${directory}`,
+    path,
+    writerFixture: "v7-session-dir-writer-fields.lsof",
+  });
+  assert.equal((await backend(explicitRuntime).list()).agents[0]?.agent, "omp");
+
+  const nestedProfileRuntime = new FakeOrcaRuntime();
+  const nestedProfilePath = `${HOME}/.omp/profiles/team/agent/sessions/nested/${filename}`;
+  installOmpProcess(nestedProfileRuntime, { path: nestedProfilePath });
+  assert.equal((await backend(nestedProfileRuntime).list()).agents[0]?.agent, "omp");
+
+  const nestedExplicitRuntime = new FakeOrcaRuntime();
+  const nestedExplicitPath = `${directory}/nested/${filename}`;
+  installOmpProcess(nestedExplicitRuntime, {
+    command: `omp --session-dir ${directory}`,
+    path: nestedExplicitPath,
+    writerFixture: "v7-session-dir-writer-fields.lsof",
+  });
+  const nestedExplicit = await backend(nestedExplicitRuntime).list();
+  assert.deepEqual(nestedExplicit.agents, []);
+  assert.ok(nestedExplicit.notices.includes(OMP_RESUME_NOTICE));
+});
+
+test("OMP discovery refuses unknown session configuration and PI_CODING_AGENT_DIR", async () => {
+  const unknownRuntime = new FakeOrcaRuntime();
+  installOmpProcess(unknownRuntime, { command: "omp" });
+  const unknown = await backend(unknownRuntime).list();
+  assert.deepEqual(unknown.agents, []);
+  assert.ok(unknown.notices.includes(OMP_RESUME_NOTICE));
+
+  const piRuntime = new FakeOrcaRuntime();
+  const process = installOmpProcess(piRuntime);
+  process.piCodingAgentDir = "";
+  const pi = await backend(piRuntime).list();
+  assert.deepEqual(pi.agents, []);
+  assert.ok(pi.notices.includes(OMP_RESUME_NOTICE));
+});
+
+test("same-tty foreground Claude/OMP nesting is rejected in both directions", async () => {
+  for (const [parentKind, childKind] of [
+    ["claude", "omp"],
+    ["omp", "claude"],
+  ] as const) {
+    const runtime = new FakeOrcaRuntime();
+    const parent =
+      parentKind === "omp"
+        ? installOmpProcess(runtime)
+        : runtime.processes[0]!;
+    const terminals = backend(runtime);
+    const owner = (await terminals.list()).agents.find(({ agent }) => agent === parentKind);
+    assert.ok(owner, `${parentKind} parent is discoverable before nesting`);
+    const childPid = 41313;
+    const child: ProcessFixture = {
+      ...parent,
+      pid: childPid,
+      ppid: parent.pid,
+      pgid: childPid,
+      tpgid: childPid,
+      lstart: "Mon Sep 28 20:44:00 2026",
+      command: childKind === "omp" ? "omp --profile team" : capture.process.command,
+    };
+    runtime.processes = [parent, child];
+
+    assert.deepEqual((await terminals.list()).agents, [], `${parentKind} containing ${childKind}`);
+    assert.equal(await terminals.sameProcess(owner.ref), false, `${parentKind} containing ${childKind}`);
+  }
+});
+
+test("OMP submits use one exact verified write and keep all answer channels terminal-only", async () => {
+  for (const scenario of [
+    { stages: ["input_accepted", "turn_started"], expected: "started" },
+    { stages: ["input_accepted"], expected: "accepted" },
+  ] as const) {
+    const runtime = new FakeOrcaRuntime();
+    const process = installOmpProcess(runtime);
+    const target = `orca:${process.paneKey}`;
+    runtime.screen = capturedOmpScreen("idle.screen.json");
+    runtime.sendReceipt = withSendStages(capturedOmpSendResult, scenario.stages);
+    const terminals = backend(runtime);
+    const agent = await terminals.get(target);
+    assert.ok(agent);
+    assert.equal(agent.agent, "omp");
+
+    const order: string[] = [];
+    const sameProcess = terminals.sameProcess.bind(terminals);
+    terminals.sameProcess = async (ref) => {
+      const current = await sameProcess(ref);
+      order.push("sameProcess");
+      return current;
+    };
+    const execFile = runtime.execFile.bind(runtime);
+    runtime.execFile = async (file, args, options) => {
+      if (file === runtime.bin && args[0] === "terminal" && args[1] === "send") order.push("send");
+      return execFile(file, args, options);
+    };
+
+    assert.equal(
+      await terminals.submit(agent.ref, "hello", { ...submitContext(), driver: ompDriver }),
+      scenario.expected,
+    );
+    assert.deepEqual(order.slice(-2), ["sameProcess", "send"], "fresh process verification immediately precedes the one write");
+    assert.equal(runtime.sendCalls.length, 1);
+    assert.equal(runtime.acceptedInputWrites, 1);
+    assert.equal(runtime.sendCalls[0]!.timeoutMs, 25_000);
+    assert.deepEqual(runtime.sendCalls[0]!.args, [
+      "terminal",
+      "send",
+      "--terminal",
+      OMP_HANDLE,
+      "--text",
+      "hello",
+      "--enter",
+      "--wait-submit",
+      "15",
+      "--json",
+    ]);
+
+    const callsBeforeAnswer = runtime.calls.length;
+    assert.throws(() => terminals.openAnswer(agent.ref, {} as never), ExpectationLost);
+    assert.throws(() => terminals.openBlind(agent.ref, { driver: ompDriver } as never), ExpectationLost);
+    assert.throws(() => terminals.openComposer(agent.ref, ompDriver), ExpectationLost);
+    assert.throws(() => terminals.openComposer(currentRef(), ompDriver), ExpectationLost);
+    assert.equal(runtime.calls.length, callsBeforeAnswer, "answer, blind, and composer channels do not inspect or write");
+  }
+
+  const ambiguous = new FakeOrcaRuntime();
+  const process = installOmpProcess(ambiguous);
+  const target = `orca:${process.paneKey}`;
+  ambiguous.screen = capturedOmpScreen("idle.screen.json");
+  ambiguous.sendFailure = { stdout: "", stderr: "transport failed", exitCode: 1, error: "transport failed" };
+  ambiguous.sendFailureAfterAccept = true;
+  const terminals = backend(ambiguous);
+  const agent = await terminals.get(target);
+  assert.ok(agent);
+  await assert.rejects(
+    terminals.submit(agent.ref, "hello", { ...submitContext(), driver: ompDriver }),
+    WriteOutcomeUnknown,
+  );
+  assert.equal(ambiguous.acceptedInputWrites, 1, "the failed response may follow accepted input");
+  assert.equal(ambiguous.sendCalls.length, 1, "an ambiguous OMP write is never retried");
+});
+
+test("OMP submit maps Orca prompt gates and unaccepted receipts without retrying", async () => {
+  const gated = new FakeOrcaRuntime();
+  const gatedProcess = installOmpProcess(gated);
+  const gatedTarget = `orca:${gatedProcess.paneKey}`;
+  gated.screen = capturedOmpScreen("idle.screen.json");
+  gated.sendFailure = failure("agent_prompt_blocked", "prompt is blocking");
+  const gatedTerminals = backend(gated);
+  const gatedAgent = await gatedTerminals.get(gatedTarget);
+  assert.ok(gatedAgent);
+  await assert.rejects(
+    gatedTerminals.submit(gatedAgent.ref, "hello", { ...submitContext(), driver: ompDriver }),
+    (error: unknown) => error instanceof SubmitRefused && error.reason === "gate",
+  );
+  assert.equal(gated.sendCalls.length, 1);
+
+  const unaccepted = new FakeOrcaRuntime();
+  const unacceptedProcess = installOmpProcess(unaccepted);
+  const unacceptedTarget = `orca:${unacceptedProcess.paneKey}`;
+  unaccepted.screen = capturedOmpScreen("idle.screen.json");
+  unaccepted.sendReceipt = withSendStages(capturedOmpSendResult, [], false);
+  const unacceptedTerminals = backend(unaccepted);
+  const unacceptedAgent = await unacceptedTerminals.get(unacceptedTarget);
+  assert.ok(unacceptedAgent);
+  await assert.rejects(
+    unacceptedTerminals.submit(unacceptedAgent.ref, "hello", { ...submitContext(), driver: ompDriver }),
+    WriteOutcomeUnknown,
+  );
+  assert.equal(unaccepted.sendCalls.length, 1);
+  assert.equal(unaccepted.acceptedInputWrites, 0);
+});
+
+test("OMP working, waiting, draft, and incomplete screens never send input", async () => {
+  const cases: Array<{ name: string; screen: JsonObject; reason: SubmitRefused["reason"] }> = [
+    { name: "working", screen: capturedOmpScreen("working.screen.json"), reason: "not-idle" },
+    { name: "waiting", screen: capturedOmpScreen("ask-open.screen.json"), reason: "not-idle" },
+    { name: "draft", screen: capturedOmpScreen("draft.screen.json"), reason: "not-idle" },
+    {
+      name: "incomplete",
+      screen: { ...capturedOmpScreen("idle.screen.json"), limited: true },
+      reason: "incomplete-screen",
+    },
+  ];
+
+  for (const scenario of cases) {
+    const runtime = new FakeOrcaRuntime();
+    const process = installOmpProcess(runtime);
+    const target = `orca:${process.paneKey}`;
+    runtime.screen = scenario.screen;
+    const terminals = backend(runtime);
+    const agent = await terminals.get(target);
+    assert.ok(agent, scenario.name);
+    await assert.rejects(
+      terminals.submit(agent.ref, "hello", { ...submitContext(), driver: ompDriver }),
+      (error: unknown) => error instanceof SubmitRefused && error.reason === scenario.reason,
+      scenario.name,
+    );
+    assert.equal(runtime.sendCalls.length, 0, scenario.name);
+    assert.equal(runtime.acceptedInputWrites, 0, scenario.name);
+  }
+});
+
+test("OMP submit refuses when the transcript-bound process changes after the complete screen read", async () => {
+  const runtime = new FakeOrcaRuntime();
+  const process = installOmpProcess(runtime);
+  const target = `orca:${process.paneKey}`;
+  runtime.screen = capturedOmpScreen("idle.screen.json");
+  const terminals = backend(runtime);
+  const agent = await terminals.get(target);
+  assert.ok(agent);
+  runtime.screenReadHook = () => {
+    runtime.processes = [{ ...process, lstart: "Mon Sep 28 20:44:00 2026" }];
+  };
+
+  await assert.rejects(
+    terminals.submit(agent.ref, "hello", { ...submitContext(), driver: ompDriver }),
+    (error: unknown) => error instanceof SubmitRefused && error.reason === "agent-changed",
+  );
+  assert.equal(runtime.sendCalls.length, 0);
+});
+
 test("recognizes Claude Code running through its Node entrypoint", async () => {
   const runtime = new FakeOrcaRuntime();
   runtime.processes = [
@@ -972,7 +1604,7 @@ test("Orca submit separates started and accepted receipts and never resends ambi
   ] as const) {
     const runtime = new FakeOrcaRuntime();
     runtime.screen = capturedClaudeScreen("idle-composer.screen.json");
-    runtime.sendReceipt = { send: { accepted: true, prompt: { stages: [...scenario.stages] } } };
+    runtime.sendReceipt = withSendStages(capturedSendResult, scenario.stages);
     assert.equal(await backend(runtime).submit(currentRef(), "hello", submitContext()), scenario.expected);
     assert.equal(runtime.sendCalls.length, 1);
     assert.equal(runtime.acceptedInputWrites, 1);
@@ -1033,7 +1665,7 @@ test("Orca classifies unconfirmed sends as outcome-unknown without retrying", as
 
   const unconfirmedReceipt = new FakeOrcaRuntime();
   unconfirmedReceipt.screen = capturedClaudeScreen("idle-composer.screen.json");
-  unconfirmedReceipt.sendReceipt = { send: { accepted: false } };
+  unconfirmedReceipt.sendReceipt = withSendStages(capturedSendResult, [], false);
   await assert.rejects(
     backend(unconfirmedReceipt).submit(currentRef(), "hello", submitContext()),
     WriteOutcomeUnknown,

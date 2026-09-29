@@ -50,13 +50,14 @@ export function agentPickerBlocks(result: ListResult, enabledBackends: readonly 
     ];
   }
 
-  const groups = new Map<string, { backend: BackendName; cwd: string; agents: AgentInfo[] }>();
+  const groups = new Map<string, { label: string; cwd: string; agents: AgentInfo[] }>();
   for (const agent of agents) {
     const backend = backendForTarget(agent.ref.target);
-    const key = `${backend}\0${agent.cwd}`;
+    const label = agent.agent === "omp" ? "omp" : backend;
+    const key = `${backend}\0${label}\0${agent.cwd}`;
     const group = groups.get(key);
     if (group) group.agents.push(agent);
-    else groups.set(key, { backend, cwd: agent.cwd, agents: [agent] });
+    else groups.set(key, { label, cwd: agent.cwd, agents: [agent] });
   }
 
   return [
@@ -67,8 +68,8 @@ export function agentPickerBlocks(result: ListResult, enabledBackends: readonly 
         type: "static_select",
         action_id: "pair_select",
         placeholder: { type: "plain_text", text: "インスタンスを選択" },
-        option_groups: [...groups.values()].map(({ backend, cwd, agents: group }) => ({
-          label: { type: "plain_text", text: `${backend} · ${dirLabel(cwd)}`.slice(0, 75) },
+        option_groups: [...groups.values()].map(({ label: groupLabel, cwd, agents: group }) => ({
+          label: { type: "plain_text", text: `${groupLabel} · ${dirLabel(cwd)}`.slice(0, 75) },
           options: group.map((agent) => {
             const prefix = agent.agent !== "claude" ? `[${agent.agent}] ` : "";
             const label = agent.terminalTitle ?? agent.displayId;

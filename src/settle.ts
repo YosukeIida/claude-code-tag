@@ -63,6 +63,10 @@ export class SettleTracker {
   get settledByTranscript(): boolean {
     return this.phase === "finished";
   }
+  /** Whether a start has been observed and no completion has followed it. */
+  get turnRunning(): boolean {
+    return this.phase === "running";
+  }
 
   /**
    * herdr's status, corrected only where the transcript contradicts it.

@@ -1,8 +1,9 @@
 import type { BlindPermissionPrompt, VerifiedPrompt } from "../backend/prompt.js";
 import type { AnswerChannel, ComposerChannel, Terminals } from "../backend/index.js";
-import type { AgentInfo, AgentRef, ScreenSnapshot } from "../backend/types.js";
+import type { AgentInfo, AgentRef, ScreenSnapshot, TranscriptIdentity } from "../backend/types.js";
 import { claudeDriver } from "./claude/driver.js";
 import { codexDriver } from "./codex/driver.js";
+import { ompDriver } from "./omp/driver.js";
 
 export interface PermissionChoice {
   num: string;
@@ -109,17 +110,28 @@ export interface ModeSupport {
 }
 
 /**
- * Everything that differs between coding-agent CLIs cctag drives through
- * herdr: how to locate/parse the session transcript, how to read and answer a
- * blocked pane's prompt, and how to run agent-specific slash-command-style
- * operations (`@cctag model`, `@cctag mode`). Selected per-pane from herdr's
- * live-reported `agent` field via `driverFor()` — never persisted, so a pane
- * that changes which CLI is running in it picks up the right driver on the
- * very next interaction.
+ * Agent-specific transcript, prompt, and slash-command behavior. Claude Code
+ * and Codex CLI are driven through herdr; OMP is discovered by Orca and is
+ * read-only. Each backend selects the matching driver from its live agent or
+ * process identity rather than persisting that choice.
  */
+export interface OrcaProcessIdentity {
+  readonly pid: number;
+  readonly command: string;
+  readonly cwd: string | null;
+  readonly piCodingAgentDirSet: boolean;
+}
+
+export interface OrcaProcessSession {
+  readonly sessionId: string;
+  readonly transcriptIdentity?: TranscriptIdentity;
+}
+
 export interface OrcaProcessAccess {
   homeDir: string;
   readFile(path: string): Promise<string>;
+  readTranscriptHead(path: string): Promise<string>;
+  runSystem(file: string, args: string[]): Promise<string>;
 }
 
 /** OS-process identity hooks used only by the Orca backend. */
@@ -134,9 +146,11 @@ export interface OrcaProcessDriver {
   };
   /** Notice included when a recognized driver is not supported by Orca. */
   readonly unsupportedNotice?: string;
+  /** Notice included when a recognized process has no verifiable session. */
+  readonly sessionUnavailableNotice?: string;
   matchesCommand(command: string): boolean;
   /** Missing session identity makes the process ineligible for listing. */
-  sessionId?(pid: number, access: OrcaProcessAccess): Promise<string>;
+  session?(process: OrcaProcessIdentity, access: OrcaProcessAccess): Promise<OrcaProcessSession | null>;
 }
 
 export interface AgentDriver {
@@ -286,6 +300,7 @@ export function isRefusalLabel(label: string): boolean {
 const REGISTRY: Record<string, AgentDriver> = {
   claude: claudeDriver,
   codex: codexDriver,
+  omp: ompDriver,
 };
 export const ORCA_AGENT_DRIVERS: readonly AgentDriver[] = Object.freeze(Object.values(REGISTRY));
 

@@ -1,4 +1,4 @@
-import type { AgentStatus, BackendName } from "./backend/types.js";
+import type { AgentKind, AgentStatus, BackendName, ScreenSnapshot, TranscriptIdentity } from "./backend/types.js";
 import type { Terminals } from "./backend/index.js";
 import { backendForTarget } from "./backend/target.js";
 import type { Pairing, PairingStore } from "./pairing.js";
@@ -15,18 +15,41 @@ import {
   transcriptSizeSafe,
 } from "./agents/transcript.js";
 import { driverFor } from "./agents/driver.js";
-import { classifiedStatus, EMPTY_TRANSCRIPT_BOUNDARIES, resolveStatus, SettleTracker, transcriptBoundaries } from "./settle.js";
+import {
+  classifiedStatus,
+  EMPTY_TRANSCRIPT_BOUNDARIES,
+  resolveStatus,
+  SettleTracker,
+  transcriptBoundaries,
+  type StatusResolution,
+} from "./settle.js";
 import { promptFingerprint } from "./agents/fingerprint.js";
 import { chunkForSlack, markdownToMrkdwn } from "./slack/mrkdwn.js";
+import { OMP_RESUME_NOTICE } from "./agents/omp/driver.js";
+import { createOmpStatusMemory, resolveOmpStatus, type OmpStatusResolution } from "./agents/omp/status.js";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+function sameTranscriptIdentity(
+  left: TranscriptIdentity | undefined,
+  right: TranscriptIdentity | undefined,
+): boolean {
+  return (
+    left !== undefined &&
+    right !== undefined &&
+    left.path === right.path &&
+    left.device === right.device &&
+    left.inode === right.inode
+  );
 }
 
 interface WatchState {
   pairingKey: string;
   sessionId: string;
   transcriptPath: string;
+  transcriptIdentity?: TranscriptIdentity;
+  agentKind: AgentKind;
   offset: number;
   /** When this watch was (re)baselined. A transcript created after it holds
    *  nothing this watcher could already have reported. */
@@ -46,6 +69,12 @@ interface WatchState {
    * turn): each `started` it sees re-arms it for the next terminal-side turn.
    */
   settle: SettleTracker;
+  /** A start observed beyond this watch's baseline, retained across unknown screens. */
+  startedSinceBaseline: boolean;
+  ompStatus: ReturnType<typeof createOmpStatusMemory> | null;
+  /** OMP binding loss is terminal for this session; a fresh session rebaselines. */
+  ompBindingLost: boolean;
+  ompNoticePosted: boolean;
 }
 
 /**
@@ -57,12 +86,9 @@ interface WatchState {
  * the thread when the instance settles (working -> idle/done) with new
  * assistant output.
  *
- * If it instead finds the instance `blocked` — an AskUserQuestion or
- * permission prompt is on screen, waiting on a decision — it doesn't just
- * wait for that to resolve on its own (it might never, if no one's at the
- * keyboard): it hands the terminal off to TurnEngine.adoptBlockedTerminal(),
- * which runs the same pollLoop() a Slack-initiated turn uses, so the prompt
- * gets posted as Slack buttons and can be answered remotely.
+ * For OMP, the handoff carries a terminal-only screen notice and never exposes
+ * answer buttons. Other drivers hand blocked prompts to TurnEngine so they can
+ * be answered remotely.
  *
  * It deliberately does not replay history: the first time it sees a pairing
  * (including right after an active turn just finished, when it resumes
@@ -200,6 +226,11 @@ export class BackgroundWatcher {
       // pane leaves a shell prompt: get returns null while exists still returns
       // true. BackendUnavailable throws into tick() and is never treated as absence.
       if (await this.terminals.exists(pairing.paneId)) {
+        const existing = this.watches.get(pairing.paneId);
+        if (existing?.agentKind === "omp") {
+          await this.noteOmpBindingLoss(pairing, existing);
+          return;
+        }
         // Waited on, but not indefinitely. The grace period is what makes a
         // restart survivable; letting it run forever is what left threads
         // paired to panes whose agent was exited hours earlier.
@@ -251,7 +282,20 @@ export class BackgroundWatcher {
 
     const existing = this.watches.get(pairing.paneId);
     const sessionId = agent.sessionId ?? "";
-    let sessionRotated = existing !== undefined && sessionId !== "" && sessionId !== existing.sessionId;
+    if (
+      existing?.ompBindingLost &&
+      existing.agentKind === "omp" &&
+      agent.agent === "omp" &&
+      sessionId === existing.sessionId &&
+      sameTranscriptIdentity(existing.transcriptIdentity, agent.transcriptIdentity)
+    ) {
+      return;
+    }
+    let sessionRotated =
+      existing !== undefined &&
+      ((sessionId !== "" && sessionId !== existing.sessionId) ||
+        existing.agentKind !== agent.agent ||
+        (agent.agent === "omp" && !sameTranscriptIdentity(existing.transcriptIdentity, agent.transcriptIdentity)));
 
     // A session id is the cheap way to notice the CLI restarted, but not every
     // agent reports one — Codex routinely doesn't, which is exactly why both
@@ -269,7 +313,7 @@ export class BackgroundWatcher {
     // every record therefore postdates it — see the offset choice below.
     let transcriptAppeared = false;
     if (existing !== undefined && !sessionRotated && (sessionId === "" || existing.transcriptPath === "")) {
-      const resolved = driver.locateTranscript(agent.cwd, agent.sessionId) ?? "";
+      const resolved = agent.transcriptIdentity?.path ?? driver.locateTranscript(agent.cwd, agent.sessionId) ?? "";
       if (resolved !== existing.transcriptPath) {
         sessionRotated = true;
         // Two guards on reading a newly-resolved transcript from the start.
@@ -292,7 +336,7 @@ export class BackgroundWatcher {
     }
 
     if (!existing || existing.pairingKey !== pairing.key || sessionRotated || forceRebaseline) {
-      const tPath = driver.locateTranscript(agent.cwd, agent.sessionId) ?? "";
+      const tPath = agent.transcriptIdentity?.path ?? driver.locateTranscript(agent.cwd, agent.sessionId) ?? "";
       const capturedOffset =
         tPath && !transcriptAppeared
           ? agent.evidence.kind === "hint"
@@ -329,6 +373,8 @@ export class BackgroundWatcher {
         pairingKey: pairing.key,
         sessionId,
         transcriptPath: tPath,
+        transcriptIdentity: agent.transcriptIdentity,
+        agentKind: agent.agent,
         // Normally the captured end of the file (the last complete record for
         // hint evidence): existing output either predates watching or was already
         // reported, and replaying it would dump an old session into the thread.
@@ -346,6 +392,10 @@ export class BackgroundWatcher {
         outboxBaseline: snapshotOutbox(agent.cwd),
         writes: new WrittenFileTracker(),
         settle,
+        ompStatus: agent.agent === "omp" ? createOmpStatusMemory() : null,
+        startedSinceBaseline: false,
+        ompBindingLost: false,
+        ompNoticePosted: false,
       });
       return;
     }
@@ -370,6 +420,7 @@ export class BackgroundWatcher {
           return;
         }
       }
+      if (state.agentKind === "omp" && !(await this.revalidateOmpTranscript(pairing, state, agent))) return;
       state.offset = newOffset;
       const output = driver.extractTurnOutput(records);
       state.collected.push(...output.texts);
@@ -381,27 +432,52 @@ export class BackgroundWatcher {
       sawStartThisTick = lifecycle.some((event) => event.kind === "started");
       sawCompletionThisTick = lifecycle.some((event) => event.kind !== "started");
       state.settle.observe(lifecycle);
+      if (agent.evidence.kind === "hint" && sawStartThisTick) state.startedSinceBaseline = true;
     }
 
-    // Both status paths use this resolver: herdr keeps the existing settle
-    // correction, while Orca compares its hint with a bounded transcript tail.
-    const boundaries =
-      agent.evidence.kind === "hint" && state.transcriptPath
-        ? transcriptBoundaries(driver.extractLifecycle(await readRecentRecords(state.transcriptPath)))
-        : EMPTY_TRANSCRIPT_BOUNDARIES;
-    const resolution = await resolveStatus({
-      evidence: agent.evidence,
-      settle: state.settle,
-      boundaries,
-      previousStatus: state.lastStatus,
-      readScreen: async () => {
-        const snapshot = await this.terminals.read(agent.ref.target, 40, "screen");
-        return {
-          snapshot,
-          fingerprint: snapshot.complete ? promptFingerprint(driver.parseBlockedPane(snapshot.text)) : null,
-        };
-      },
-    });
+    // Herdr keeps the shared settle correction. OMP requires a complete screen
+    // and two matching waiting fingerprints before it can become blocked.
+    let boundaries = EMPTY_TRANSCRIPT_BOUNDARIES;
+    if (agent.evidence.kind === "hint" && state.transcriptPath) {
+      const recentRecords = await readRecentRecords(state.transcriptPath);
+      if (state.agentKind === "omp" && !(await this.revalidateOmpTranscript(pairing, state, agent))) return;
+      boundaries = transcriptBoundaries(driver.extractLifecycle(recentRecords));
+    }
+
+    let resolution: StatusResolution;
+    let ompResolution: OmpStatusResolution | null = null;
+    if (state.agentKind === "omp") {
+      let snapshot: ScreenSnapshot | null = null;
+      try {
+        snapshot = await this.terminals.read(agent.ref.target, 200, "screen");
+      } catch {
+        // Unreadable screens retain the prior state and notice fingerprint.
+      }
+      if (state.transcriptPath && !(await this.revalidateOmpTranscript(pairing, state, agent))) return;
+      ompResolution = resolveOmpStatus({
+        settle: state.settle,
+        boundaries,
+        previousStatus: state.lastStatus,
+        memory: state.ompStatus ?? createOmpStatusMemory(),
+        snapshot,
+      });
+      state.ompStatus = ompResolution.memory;
+      resolution = ompResolution;
+    } else {
+      resolution = await resolveStatus({
+        evidence: agent.evidence,
+        settle: state.settle,
+        boundaries,
+        previousStatus: state.lastStatus,
+        readScreen: async () => {
+          const snapshot = await this.terminals.read(agent.ref.target, 40, "screen");
+          return {
+            snapshot,
+            fingerprint: snapshot.complete ? promptFingerprint(driver.parseBlockedPane(snapshot.text)) : null,
+          };
+        },
+      });
+    }
     const status = resolution.status;
     const previousStatus = state.lastStatus;
 
@@ -416,6 +492,7 @@ export class BackgroundWatcher {
         driver,
         sessionId: state.sessionId,
         transcriptPath: state.transcriptPath,
+        transcriptIdentity: state.transcriptIdentity,
         offset: state.offset,
         collected: state.collected,
         backend: backendForTarget(agent.ref.target),
@@ -424,6 +501,9 @@ export class BackgroundWatcher {
         cwd: agent.cwd,
         outboxBaseline: state.outboxBaseline,
         writes: state.writes,
+        ompStatus: ompResolution?.memory,
+        ompNotice: ompResolution?.notice ?? undefined,
+        ompFingerprint: ompResolution?.fingerprint ?? undefined,
       });
       if (adopted) this.watches.delete(pairing.paneId);
       return;
@@ -435,7 +515,10 @@ export class BackgroundWatcher {
       sawCompletionThisTick &&
       state.settle.settledByTranscript;
     const wasActive =
-      previousStatus === "working" || previousStatus === "blocked" || completedInOnePoll;
+      previousStatus === "working" ||
+      previousStatus === "blocked" ||
+      state.startedSinceBaseline ||
+      completedInOnePoll;
     const nowSettled = status === "idle" || status === "done";
 
     if (wasActive && nowSettled) {
@@ -473,6 +556,7 @@ export class BackgroundWatcher {
         handedOver,
       );
       state.writes.forget(handedOver);
+      state.startedSinceBaseline = false;
     }
 
     // The corrected status, not herdr's: storing `working` for a pane the
@@ -491,6 +575,44 @@ export class BackgroundWatcher {
    * has a pairing. The Slack post is best-effort: the local state must end up
    * consistent whether or not the thread can be reached.
    */
+  private async noteOmpBindingLoss(pairing: Pairing, state: WatchState): Promise<void> {
+    this.agentlessPanes.delete(pairing.paneId);
+    state.ompBindingLost = true;
+    state.collected = [];
+    state.writes = new WrittenFileTracker();
+    if (state.ompNoticePosted) return;
+    state.ompNoticePosted = true;
+    await this.notifier
+      .postReply(pairing.channel, pairing.threadTs ?? "", OMP_RESUME_NOTICE)
+      .catch((error) => console.error(`[watcher] could not report OMP transcript loss for ${pairing.paneId}:`, error));
+  }
+
+  private async revalidateOmpTranscript(
+    pairing: Pairing,
+    state: WatchState,
+    beforeRead: { ref: { target: string }; sessionId: string | null; transcriptIdentity?: TranscriptIdentity },
+  ): Promise<boolean> {
+    const current = await this.terminals.get(beforeRead.ref.target);
+    if (!current) {
+      state.ompBindingLost = true;
+      state.collected = [];
+      state.writes = new WrittenFileTracker();
+      if (await this.terminals.exists(beforeRead.ref.target)) await this.noteOmpBindingLoss(pairing, state);
+      return false;
+    }
+    if (
+      current.agent !== "omp" ||
+      current.sessionId !== beforeRead.sessionId ||
+      !sameTranscriptIdentity(current.transcriptIdentity, beforeRead.transcriptIdentity)
+    ) {
+      state.ompBindingLost = true;
+      state.collected = [];
+      state.writes = new WrittenFileTracker();
+      return false;
+    }
+    return true;
+  }
+
   private async unpair(pairing: Pairing, logLine: string, message: string): Promise<void> {
     this.pairingStore.remove(pairing.key);
     this.watches.delete(pairing.paneId);

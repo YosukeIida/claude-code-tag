@@ -174,6 +174,9 @@ export function helpTextFor(driver: AgentDriver | null): string {
 const BUSY_MESSAGE =
   "⏳ このインスタンスは実行中です（このスレッドの `⚙️ 実行中…` の行が現在の状態です）。完了すると結果が投稿されるので、それから送ってください。";
 const EXPECTATION_LOST_REPLY = "画面が変わったため、回答を途中で止めました。端末で確かめてください";
+const OMP_UNSUPPORTED_MESSAGE = "omp では使えません";
+const OMP_BUTTON_REFUSAL = "もう回答できません";
+const OMP_THREAD_REPLY = "omp の質問・確認には、端末で答えてください";
 
 const MODEL_COMMAND_RE = /^model\s+(\S[\s\S]*)$/i;
 const MODE_COMMAND_RE = /^mode\s+(\S+)$/i;
@@ -300,12 +303,10 @@ export class CommandHandler {
         );
         return;
       }
-      // Claimed before the agentGet, not after: the check and the claim used to
-      // be separated by that await, so a message arriving in between passed the
-      // same check and drove the same TUI.
       const lease = this.turnEngine.acquire(pairing.paneId, "model-command");
       if (!lease) {
-        await this.notifier.postReply(channel, threadTs, BUSY_MESSAGE);
+        const omp = await this.currentAgentIsOmpOrWaiting(pairing.paneId);
+        await this.notifier.postReply(channel, threadTs, omp ? OMP_UNSUPPORTED_MESSAGE : BUSY_MESSAGE);
         return;
       }
       try {
@@ -316,6 +317,10 @@ export class CommandHandler {
         }
         if (lease.cancelled) return;
         const driver = driverFor(agent.agent);
+        if (driver.kind === "omp") {
+          await this.notifier.postReply(channel, threadTs, OMP_UNSUPPORTED_MESSAGE);
+          return;
+        }
         const reply = await driver.runModelCommand(this.terminals, agent, modelMatch[1].trim());
         await this.notifier.postReply(channel, threadTs, reply);
       } finally {
@@ -341,6 +346,10 @@ export class CommandHandler {
         return;
       }
       const driver = driverFor(agent.agent);
+      if (driver.kind === "omp") {
+        await this.notifier.postReply(channel, threadTs, OMP_UNSUPPORTED_MESSAGE);
+        return;
+      }
       if (!driver.modes) {
         await this.notifier.postReply(channel, threadTs, `⚠️ \`mode\` は ${driver.displayName} では利用できません。`);
         return;
@@ -381,6 +390,10 @@ export class CommandHandler {
           return;
         }
         const driver = driverFor(agent.agent);
+        if (driver.kind === "omp") {
+          await this.notifier.postReply(channel, threadTs, OMP_UNSUPPORTED_MESSAGE);
+          return;
+        }
         if (!driver.modes) {
           await this.notifier.postReply(channel, threadTs, `⚠️ \`plan\` は ${driver.displayName} では利用できません。`);
           return;
@@ -507,6 +520,10 @@ export class CommandHandler {
       );
       return;
     }
+    if (this.turnEngine.isOmpWaiting?.(pairing.paneId)) {
+      await this.notifier.postReply(channel, threadTs, OMP_THREAD_REPLY);
+      return;
+    }
     if (this.turnEngine.isBusy(pairing.paneId)) {
       await this.notifier.postReply(channel, threadTs, BUSY_MESSAGE);
       return;
@@ -541,6 +558,21 @@ export class CommandHandler {
     }
   }
 
+  private async currentAgentIsOmpOrWaiting(paneId: string): Promise<boolean> {
+    if (this.turnEngine.isOmpWaiting?.(paneId)) return true;
+    if (typeof this.terminals.get !== "function") return false;
+    try {
+      return (await this.terminals.get(paneId))?.agent === "omp";
+    } catch {
+      return false;
+    }
+  }
+
+  private async refuseOmpButton(channel: string, threadTs: string, paneId: string): Promise<boolean> {
+    if (!(await this.currentAgentIsOmpOrWaiting(paneId))) return false;
+    await this.notifier.postReply(channel, threadTs, OMP_BUTTON_REFUSAL);
+    return true;
+  }
   /**
    * `@cctag mode <name>` — switches the paired session to one of the
    * driver's Shift+Tab-style modes (only Claude Code has these; callers
@@ -561,13 +593,18 @@ export class CommandHandler {
     if (!modes) return; // callers gate on this; defensive no-op if reached anyway
     const lease = this.turnEngine.acquire(paneId, "mode-command");
     if (!lease) {
-      await this.notifier.postReply(channel, threadTs, BUSY_MESSAGE);
+      const omp = await this.currentAgentIsOmpOrWaiting(paneId);
+      await this.notifier.postReply(channel, threadTs, omp ? OMP_UNSUPPORTED_MESSAGE : BUSY_MESSAGE);
       return;
     }
     try {
       const agent = await this.terminals.get(paneId);
       if (!agent) {
         await this.notifier.postReply(channel, threadTs, "⚠️ インスタンスが見つかりません。");
+        return;
+      }
+      if (agent.agent === "omp") {
+        await this.notifier.postReply(channel, threadTs, OMP_UNSUPPORTED_MESSAGE);
         return;
       }
       if (lease.cancelled) return;
@@ -629,6 +666,10 @@ export class CommandHandler {
         threadTs,
         NOT_CONNECTED_MESSAGE,
       );
+      return;
+    }
+    if (this.turnEngine.isOmpWaiting?.(pairing.paneId)) {
+      await this.notifier.postReply(channel, threadTs, OMP_THREAD_REPLY);
       return;
     }
     if (this.turnEngine.isBusy(pairing.paneId)) {
@@ -792,6 +833,7 @@ export class CommandHandler {
   }
 
   async handleAskUserQuestionButton(ctx: AskUserQuestionButtonContext): Promise<void> {
+    if (await this.refuseOmpButton(ctx.channel, ctx.threadTs, ctx.terminalId)) return;
     try {
       const result = await this.turnEngine.answerQuestionButton(
         ctx.terminalId,
@@ -810,6 +852,7 @@ export class CommandHandler {
   }
 
   async handleAskUserQuestionMultiSelect(ctx: AskUserQuestionMultiSelectContext): Promise<void> {
+    if (await this.refuseOmpButton(ctx.channel, ctx.threadTs, ctx.terminalId)) return;
     if (ctx.optionIndices === null) {
       await this.notifier.postReply(
         ctx.channel,
@@ -840,6 +883,7 @@ export class CommandHandler {
   }
 
   async handlePermissionButton(ctx: PermissionButtonContext): Promise<void> {
+    if (await this.refuseOmpButton(ctx.channel, ctx.threadTs, ctx.terminalId)) return;
     try {
       const result = await this.turnEngine.answerPermissionButton(
         ctx.terminalId,
@@ -871,6 +915,10 @@ export class CommandHandler {
   async handleFreeTextMessage(ctx: FreeTextContext): Promise<void> {
     const pairing = this.pairingStore.get(ctx.channel, ctx.threadTs);
     if (!pairing) return;
+    if (await this.currentAgentIsOmpOrWaiting(pairing.paneId)) {
+      await this.notifier.postReply(ctx.channel, ctx.threadTs, OMP_THREAD_REPLY);
+      return;
+    }
     try {
       const asQuestion = await this.turnEngine.answerQuestionFreeText(pairing.paneId, ctx.text);
       if (asQuestion.ok) return;

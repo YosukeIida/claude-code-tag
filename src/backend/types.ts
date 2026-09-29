@@ -14,17 +14,29 @@ export type StatusEvidence =
   | { kind: "classified"; status: AgentStatus }
   | { kind: "hint"; state: "working" | "waiting" | "done" | null; waitingSince: number | null };
 
+export type AgentKind = "claude" | "codex" | "omp";
+
+export interface TranscriptIdentity {
+  readonly path: string;
+  readonly device: string;
+  readonly inode: string;
+}
+
 export interface AgentRef {
   readonly target: string;
   readonly pid: number | null;
   readonly processStartedAt: number | null;
+  readonly agentKind?: AgentKind;
+  readonly sessionId?: string | null;
+  readonly transcriptIdentity?: TranscriptIdentity;
 }
 
 export interface AgentInfo {
   ref: AgentRef;
   backend: BackendName;
-  agent: "claude" | "codex";
+  agent: AgentKind;
   sessionId: string | null;
+  transcriptIdentity?: TranscriptIdentity;
   cwd: string;
   evidence: StatusEvidence;
   terminalTitle: string | null;

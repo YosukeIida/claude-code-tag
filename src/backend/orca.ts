@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
-import { readFile } from "node:fs/promises";
+import { open, readFile } from "node:fs/promises";
 import { promisify } from "node:util";
-import type { AgentDriver, OrcaProcessAccess } from "../agents/driver.js";
+import type { AgentDriver, OrcaProcessAccess, OrcaProcessIdentity, OrcaProcessSession } from "../agents/driver.js";
 import { ORCA_AGENT_DRIVERS } from "../agents/driver.js";
 import type {
   AnswerChannel,
@@ -22,6 +22,7 @@ import {
   type AgentRef,
   type ListResult,
   type ScreenSnapshot,
+  type TranscriptIdentity,
   SubmitRefused,
   UnknownTarget,
   UNSENDABLE_TEXT_MESSAGE,
@@ -44,7 +45,7 @@ export interface OrcaExecResult {
   error?: string;
 }
 
-export interface OrcaRuntime extends OrcaProcessAccess {
+export interface OrcaRuntime extends Omit<OrcaProcessAccess, "runSystem"> {
   execFile(file: string, args: string[], options: { timeoutMs: number }): Promise<OrcaExecResult>;
 }
 
@@ -60,6 +61,7 @@ interface ProcessRow {
   paneKey?: string;
   terminalHandle?: string;
   cwd?: string;
+  piCodingAgentDirSet?: boolean;
 }
 
 type AgentProcessRow = ProcessRow & { driver: AgentDriver };
@@ -144,8 +146,10 @@ function parsePsRows(output: string, drivers: readonly AgentDriver[]): ProcessRo
   return output.split("\n").map((line) => parsePsRow(line, drivers)).filter((row): row is ProcessRow => row !== null);
 }
 
-function parseEnvironmentRows(output: string): Map<number, { paneKey?: string; terminalHandle?: string }> {
-  const environments = new Map<number, { paneKey?: string; terminalHandle?: string }>();
+function parseEnvironmentRows(
+  output: string,
+): Map<number, { paneKey?: string; terminalHandle?: string; piCodingAgentDirSet: boolean }> {
+  const environments = new Map<number, { paneKey?: string; terminalHandle?: string; piCodingAgentDirSet: boolean }>();
   for (const line of output.split("\n")) {
     const match = line.match(/^\s*(\d+)\s+(.*)$/);
     if (!match) continue;
@@ -153,7 +157,8 @@ function parseEnvironmentRows(output: string): Map<number, { paneKey?: string; t
     const command = match[2] ?? "";
     const paneKey = command.match(/(?:^|\s)ORCA_PANE_KEY=([^\s]+)/)?.[1];
     const terminalHandle = command.match(/(?:^|\s)ORCA_TERMINAL_HANDLE=([^\s]+)/)?.[1];
-    environments.set(pid, { paneKey, terminalHandle });
+    const piCodingAgentDirSet = /(?:^|\s)PI_CODING_AGENT_DIR(?:=[^\s]*)?(?=\s|$)/u.test(command);
+    environments.set(pid, { paneKey, terminalHandle, piCodingAgentDirSet });
   }
   return environments;
 }
@@ -311,17 +316,26 @@ function agentInfo(
   paneKey: string,
   terminal: JsonObject,
   process: AgentProcessRow,
-  sessionId: string,
+  session: OrcaProcessSession,
   evidence: AgentInfo["evidence"],
 ): AgentInfo {
   const target = `orca:${paneKey}`;
   const handle = stringField(terminal, "handle") ?? "";
   const title = stringField(terminal, "title")?.trim() || null;
+  const agentKind = process.driver.kind as AgentInfo["agent"];
   return {
-    ref: { target, pid: process.pid, processStartedAt: process.startedAt },
+    ref: {
+      target,
+      pid: process.pid,
+      processStartedAt: process.startedAt,
+      agentKind,
+      sessionId: session.sessionId,
+      ...(session.transcriptIdentity ? { transcriptIdentity: session.transcriptIdentity } : {}),
+    },
     backend: "orca",
-    agent: process.driver.kind as AgentInfo["agent"],
-    sessionId,
+    agent: agentKind,
+    sessionId: session.sessionId,
+    ...(session.transcriptIdentity ? { transcriptIdentity: session.transcriptIdentity } : {}),
     cwd: process.cwd ?? "",
     evidence,
     terminalTitle: title,
@@ -355,12 +369,42 @@ async function nativeExecFile(file: string, args: string[], options: { timeoutMs
     };
   }
 }
+const MAX_SESSION_HEAD_BYTES = 64 * 1024;
+const MAX_SESSION_HEAD_LINES = 16;
+
+async function nativeReadTranscriptHead(path: string): Promise<string> {
+  const file = await open(path, "r");
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  let lines = 0;
+  try {
+    while (bytes < MAX_SESSION_HEAD_BYTES) {
+      const buffer = Buffer.allocUnsafe(Math.min(4096, MAX_SESSION_HEAD_BYTES - bytes));
+      const { bytesRead } = await file.read(buffer, 0, buffer.length, bytes);
+      if (bytesRead === 0) break;
+      let length = bytesRead;
+      for (let index = 0; index < bytesRead; index++) {
+        if (buffer[index] === 0x0a && ++lines === MAX_SESSION_HEAD_LINES) {
+          length = index + 1;
+          break;
+        }
+      }
+      chunks.push(buffer.subarray(0, length));
+      bytes += length;
+      if (lines === MAX_SESSION_HEAD_LINES) break;
+    }
+    return Buffer.concat(chunks).toString("utf8");
+  } finally {
+    await file.close();
+  }
+}
 
 export function createOrcaRuntime(): OrcaRuntime {
   return {
     homeDir: homedir(),
     execFile: nativeExecFile,
     readFile: (path) => readFile(path, "utf8"),
+    readTranscriptHead: nativeReadTranscriptHead,
   };
 }
 
@@ -379,11 +423,19 @@ function settle<T>(promise: Promise<T>): Promise<Settled<T>> {
 
 export class OrcaBackend implements Terminals {
   private hookNoticesPromise: Promise<string[]> | null = null;
+  private readonly processAccess: OrcaProcessAccess;
   constructor(
     private readonly bin: string,
     private readonly runtime: OrcaRuntime,
     private readonly drivers: readonly AgentDriver[] = ORCA_AGENT_DRIVERS,
-  ) {}
+  ) {
+    this.processAccess = {
+      homeDir: runtime.homeDir,
+      readFile: (path) => runtime.readFile(path),
+      readTranscriptHead: (path) => runtime.readTranscriptHead(path),
+      runSystem: (file, args) => this.runSystem(file, args),
+    };
+  }
 
   private async runSystem(file: string, args: string[]): Promise<string> {
     let result: OrcaExecResult;
@@ -461,6 +513,7 @@ export class OrcaBackend implements Terminals {
       const env = environment.get(row.pid);
       if (env?.paneKey) row.paneKey = env.paneKey;
       if (env?.terminalHandle) row.terminalHandle = env.terminalHandle;
+      row.piCodingAgentDirSet = env?.piCodingAgentDirSet ?? false;
     }
     if (withCwd) {
       const cwd = parseLsofCwds(
@@ -518,10 +571,16 @@ export class OrcaBackend implements Terminals {
     );
   }
 
-  private async sessionId(process: AgentProcessRow): Promise<string | null> {
+  private async session(process: AgentProcessRow): Promise<OrcaProcessSession | null> {
     const discovery = process.driver.orcaProcess;
-    if (!discovery?.listable || !discovery.sessionId) return null;
-    return discovery.sessionId(process.pid, this.runtime);
+    if (!discovery?.listable || !discovery.session) return null;
+    const identity: OrcaProcessIdentity = {
+      pid: process.pid,
+      command: process.command,
+      cwd: process.cwd ?? null,
+      piCodingAgentDirSet: process.piCodingAgentDirSet === true,
+    };
+    return discovery.session(identity, this.processAccess);
   }
 
   async list(): Promise<ListResult> {
@@ -573,17 +632,20 @@ export class OrcaBackend implements Terminals {
         notices.push(`orca:${paneKey}: ${process.driver.kind} working directory could not be read; skipped.`);
         continue;
       }
-      let sessionId: string | null;
+      let session: OrcaProcessSession | null;
       try {
-        sessionId = await this.sessionId(process);
+        session = await this.session(process);
       } catch {
-        sessionId = null;
+        session = null;
       }
-      if (!sessionId) {
-        notices.push(`orca:${paneKey}: セッションを特定できないため接続できません`);
+      if (!session) {
+        notices.push(
+          process.driver.orcaProcess?.sessionUnavailableNotice ??
+            `orca:${paneKey}: セッションを特定できないため接続できません`,
+        );
         continue;
       }
-      agents.push(agentInfo(paneKey, terminal, process, sessionId, statusEvidence(worktreeAgentForPane(worktree, paneKey))));
+      agents.push(agentInfo(paneKey, terminal, process, session, statusEvidence(worktreeAgentForPane(worktree, paneKey))));
     }
 
     return {
@@ -609,11 +671,10 @@ export class OrcaBackend implements Terminals {
     const shown = await this.terminalShow(handle);
     if (!shown || !usableTerminal(shown)) return null;
     if (!process.cwd) return null;
-    let sessionId: string;
+    let session: OrcaProcessSession | null;
     try {
-      const found = await this.sessionId(process);
-      if (!found) return null;
-      sessionId = found;
+      session = await this.session(process);
+      if (!session) return null;
     } catch {
       return null;
     }
@@ -621,7 +682,7 @@ export class OrcaBackend implements Terminals {
       paneKey,
       { ...terminal, ...shown },
       process,
-      sessionId,
+      session,
       statusEvidence(worktreeAgentForPane(worktree, paneKey), shown),
     );
   }
@@ -680,24 +741,42 @@ export class OrcaBackend implements Terminals {
   async sameProcess(ref: AgentRef): Promise<boolean> {
     const paneKey = targetPaneKey(ref.target);
     if (ref.pid === null || ref.processStartedAt === null) return false;
-    const rows = parsePsRows(await this.runSystem("ps", PS_ARGS), this.drivers);
+    const rows =
+      ref.agentKind === "omp"
+        ? await this.processRows(true)
+        : parsePsRows(await this.runSystem("ps", PS_ARGS), this.drivers);
     const current = rows.find((row) => row.pid === ref.pid);
     if (
       !current ||
       !isAgentProcess(current) ||
       !current.driver.orcaProcess?.listable ||
+      (ref.agentKind !== undefined && current.driver.kind !== ref.agentKind) ||
       current.startedAt !== ref.processStartedAt
     ) {
       return false;
     }
-    const environment = parseEnvironmentRows(
-      await this.runSystem("ps", ["eww", "-o", "pid=,command=", "-p", String(ref.pid)]),
-    );
-    const env = environment.get(ref.pid);
+    const processPaneKey =
+      ref.agentKind === "omp"
+        ? current.paneKey
+        : parseEnvironmentRows(
+            await this.runSystem("ps", ["eww", "-o", "pid=,command=", "-p", String(ref.pid)]),
+          ).get(ref.pid)?.paneKey;
+    if (
+      processPaneKey !== paneKey ||
+      !isForeground(current) ||
+      hasSameTtyForegroundChild(current, rows, processMap(rows))
+    ) {
+      return false;
+    }
+    if (ref.agentKind !== "omp") return true;
+    if (ref.sessionId == null || !ref.transcriptIdentity) return false;
+    const session = await this.session(current);
+    const identity = session?.transcriptIdentity;
     return (
-      env?.paneKey === paneKey &&
-      isForeground(current) &&
-      !hasSameTtyForegroundChild(current, rows, processMap(rows))
+      session?.sessionId === ref.sessionId &&
+      identity?.path === ref.transcriptIdentity.path &&
+      identity.device === ref.transcriptIdentity.device &&
+      identity.inode === ref.transcriptIdentity.inode
     );
   }
 
@@ -734,7 +813,6 @@ export class OrcaBackend implements Terminals {
     const checkCancelled = () => {
       if (ctx.cancelled()) throw new SubmitRefused("cancelled", "Submission was cancelled.");
     };
-
     checkCancelled();
     const handle = await this.writableHandle(ref);
     checkCancelled();
@@ -750,16 +828,19 @@ export class OrcaBackend implements Terminals {
       throw new SubmitRefused("draft", "The composer contains an unsent draft.");
     }
 
+    checkCancelled();
     let processIsCurrent = false;
     try {
       processIsCurrent = await this.sameProcess(ref);
     } catch {
       // An unreadable process identity is not permission to write.
     }
-    checkCancelled();
     if (!processIsCurrent) {
       throw new SubmitRefused("agent-changed", "The agent process changed before submit.");
     }
+    // sameProcess is the last asynchronous check; this synchronous guard
+    // catches cancellation raised while that process identity was inspected.
+    checkCancelled();
 
     let receipt: JsonObject;
     try {
@@ -774,7 +855,14 @@ export class OrcaBackend implements Terminals {
     return Array.isArray(stages) && stages.includes("turn_started") ? "started" : "accepted";
   }
 
+  private refuseOmpInput(ref: AgentRef, driverKind?: string): void {
+    if (ref.agentKind === "omp" || driverKind === "omp") {
+      throw new ExpectationLost("OMP input is unavailable through cctag.");
+    }
+  }
+
   openAnswer(ref: AgentRef, prompt: VerifiedPrompt): AnswerChannel {
+    this.refuseOmpInput(ref, prompt.driver?.kind);
     let active = true;
     let firstWrite = true;
     const throwIfExpired = () => {
@@ -876,11 +964,13 @@ export class OrcaBackend implements Terminals {
   }
 
 
-  openModelAnswer(_ref: AgentRef, _prompt: VerifiedModelMenuPrompt): ModelAnswerChannel {
+  openModelAnswer(ref: AgentRef, prompt: VerifiedModelMenuPrompt): ModelAnswerChannel {
+    this.refuseOmpInput(ref, prompt.driver?.kind);
     throw new ExpectationLost("Orca does not support Codex's Escape model menu; Claude /model commands use submit.");
   }
 
   openBlind(ref: AgentRef, prompt: BlindPermissionPrompt): BlindChannel {
+    this.refuseOmpInput(ref, prompt.driver?.kind);
     let attempted = false;
     return {
       answer: async (choice) => {
@@ -905,6 +995,7 @@ export class OrcaBackend implements Terminals {
   }
 
   openComposer(ref: AgentRef, driver: AgentDriver): ComposerChannel {
+    this.refuseOmpInput(ref, driver.kind);
     let attempted = false;
     return {
       backTab: async () => {

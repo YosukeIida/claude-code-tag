@@ -825,3 +825,219 @@ test("submit refusal text uses the target prefix instead of a mismatched stored 
     assert.deepEqual(replies, [expected]);
   }
 });
+
+function ompAgentForCommands(target = "orca:tab-7:leaf-2"): AgentInfo {
+  const sessionId = "9a51b84e-610c-4d9e-bb20-28d7c850c552";
+  const transcriptIdentity = { path: "/tmp/omp-session.jsonl", device: "1", inode: "2" };
+  return {
+    ref: { target, pid: 42, processStartedAt: 1, agentKind: "omp", sessionId, transcriptIdentity },
+    backend: "orca",
+    agent: "omp",
+    sessionId,
+    transcriptIdentity,
+    cwd: "/tmp/project",
+    evidence: { kind: "hint", state: "working", waitingSince: null },
+    terminalTitle: null,
+    terminalId: "orca-tab-7",
+    displayId: target,
+  };
+}
+
+test("blocked OMP thread replies are terminal-only for mentions and free text", async () => {
+  const replies: string[] = [];
+  let writes = 0;
+  const engine = {
+    isBusy: () => true,
+    isOmpWaiting: () => true,
+    async startTurn() {
+      writes++;
+    },
+    async answerQuestionFreeText() {
+      writes++;
+      return { ok: true };
+    },
+    async answerPlanFeedback() {
+      writes++;
+      return { ok: true };
+    },
+  } as unknown as TurnEngine;
+  const notifier = {
+    async postReply(_channel: string, _threadTs: string, text: string) {
+      replies.push(text);
+    },
+  } as unknown as Notifier;
+  const handler = new CommandHandler(
+    NO_TERMINALS,
+    { get: () => BUTTON_PAIRING } as unknown as PairingStore,
+    engine,
+    notifier,
+    OWNER,
+  );
+
+  await handler.handleMention({
+    channel: "C1",
+    threadTs: "1.1",
+    userId: OWNER,
+    text: "answer from Slack",
+    ts: "1.2",
+  });
+  await handler.handleMention({
+    channel: "C1",
+    threadTs: "1.1",
+    userId: OWNER,
+    text: "log",
+    ts: "1.3",
+  });
+  await handler.handleFreeTextMessage({ channel: "C1", threadTs: "1.1", text: "answer from Slack" });
+
+  assert.deepEqual(replies, [
+    "omp の質問・確認には、端末で答えてください",
+    "omp の質問・確認には、端末で答えてください",
+    "omp の質問・確認には、端末で答えてください",
+  ]);
+  assert.equal(writes, 0);
+});
+
+test("OMP mode plan and model commands use the exact unsupported reply without terminal writes", async () => {
+  const target = "orca:tab-7:leaf-2";
+  const pairing: Pairing = { ...BUTTON_PAIRING, paneId: target, backend: "orca" };
+  const agent = ompAgentForCommands(target);
+  const replies: string[] = [];
+  let reads = 0;
+  let writes = 0;
+  let releases = 0;
+  const terminals = {
+    async get() {
+      return agent;
+    },
+    async read() {
+      reads++;
+      return { text: "", draft: null, complete: true };
+    },
+    async submit() {
+      writes++;
+      return "accepted";
+    },
+    openComposer() {
+      writes++;
+      return { async backTab() {} };
+    },
+  } as unknown as Terminals;
+  const engine = {
+    isBusy: () => false,
+    isOmpWaiting: () => false,
+    acquire() {
+      return { cancelled: false, release() { releases++; }, signal: new AbortController().signal };
+    },
+  } as unknown as TurnEngine;
+  const notifier = {
+    async postReply(_channel: string, _threadTs: string, text: string) {
+      replies.push(text);
+    },
+  } as unknown as Notifier;
+  const handler = new CommandHandler(
+    terminals,
+    { get: () => pairing } as unknown as PairingStore,
+    engine,
+    notifier,
+    OWNER,
+  );
+  for (const text of ["mode plan", "plan", "model gpt-test"]) {
+    await handler.handleMention({ channel: "C1", threadTs: "1.1", userId: OWNER, text, ts: "1.2" });
+  }
+
+  assert.deepEqual(replies, ["omp では使えません", "omp では使えません", "omp では使えません"]);
+  assert.equal(reads, 0);
+  assert.equal(writes, 0);
+  assert.equal(releases, 1, "the model lease is released after its read-only OMP refusal");
+});
+
+test("OMP and stale Claude buttons refuse before invoking any answer channel", async () => {
+  const target = "orca:tab-7:leaf-2";
+  const pairing: Pairing = { ...BUTTON_PAIRING, paneId: target, backend: "orca" };
+  const agent = ompAgentForCommands(target);
+  const replies: string[] = [];
+  let answers = 0;
+  let reads = 0;
+  const terminals = {
+    async get() {
+      return agent;
+    },
+    async read() {
+      reads++;
+      return { text: "", draft: null, complete: true };
+    },
+  } as unknown as Terminals;
+  const engine = {
+    isOmpWaiting: () => false,
+    async answerQuestionButton() {
+      answers++;
+      return { ok: true };
+    },
+    async answerQuestionMultiSelect() {
+      answers++;
+      return { ok: true };
+    },
+    async answerPermissionButton() {
+      answers++;
+      return { ok: true };
+    },
+  } as unknown as TurnEngine;
+  const notifier = {
+    async postReply(_channel: string, _threadTs: string, text: string) {
+      replies.push(text);
+    },
+  } as unknown as Notifier;
+  const handler = new CommandHandler(
+    terminals,
+    { get: () => pairing } as unknown as PairingStore,
+    engine,
+    notifier,
+    OWNER,
+  );
+
+  await handler.handleAskUserQuestionButton({
+    channel: "C1", threadTs: "1.1", terminalId: target, promptId: 1, optionIndex: 0,
+  });
+  await handler.handleAskUserQuestionMultiSelect({
+    channel: "C1", threadTs: "1.1", terminalId: target, promptId: 1, optionIndices: null,
+  });
+  await handler.handlePermissionButton({
+    channel: "C1", threadTs: "1.1", terminalId: target, promptId: 1, num: "1",
+  });
+
+  assert.deepEqual(replies, ["もう回答できません", "もう回答できません", "もう回答できません"]);
+  assert.equal(answers, 0);
+  assert.equal(reads, 0);
+});
+
+test("disconnect cancels an OMP lease without sending terminal input", async () => {
+  let cancelled = 0;
+  let removed = 0;
+  const replies: string[] = [];
+  const engine = {
+    cancelPane() {
+      cancelled++;
+    },
+  } as unknown as TurnEngine;
+  const ompPairing: Pairing = { ...BUTTON_PAIRING, paneId: "orca:tab-7:leaf-2", backend: "orca" };
+  const pairingStore = {
+    get: () => ompPairing,
+    remove() {
+      removed++;
+      return true;
+    },
+  } as unknown as PairingStore;
+  const notifier = {
+    async postReply(_channel: string, _threadTs: string, text: string) {
+      replies.push(text);
+    },
+  } as unknown as Notifier;
+  await new CommandHandler(NO_TERMINALS, pairingStore, engine, notifier, OWNER).handleMention({
+    channel: "C1", threadTs: "1.1", userId: OWNER, text: "disconnect", ts: "1.2",
+  });
+
+  assert.equal(cancelled, 1);
+  assert.equal(removed, 1);
+  assert.deepEqual(replies, ["🔌 接続を解除しました。"]);
+});
