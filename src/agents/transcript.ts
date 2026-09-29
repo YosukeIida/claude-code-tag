@@ -2,13 +2,18 @@ import { createReadStream, statSync } from "node:fs";
 import { open } from "node:fs/promises";
 const RECENT_RECORD_LIMIT = 256;
 const RECENT_BYTE_LIMIT = 256 * 1024;
+const BACKWARD_SCAN_CHUNK_SIZE = 64 * 1024;
 
-export function transcriptSizeSafe(path: string): number {
+export function transcriptSizeIfAvailable(path: string): number | null {
   try {
     return statSync(path).size;
   } catch {
-    return 0;
+    return null;
   }
+}
+
+export function transcriptSizeSafe(path: string): number {
+  return transcriptSizeIfAvailable(path) ?? 0;
 }
 
 /**
@@ -149,6 +154,116 @@ export async function readRecentRecords(path: string): Promise<Record<string, un
     return records;
   } catch {
     return [];
+  } finally {
+    await file.close().catch(() => {});
+  }
+}
+/**
+ * Reads complete JSONL records backwards from a fixed byte offset. Bytes
+ * appended after `endOffset` are never part of this snapshot; the returned
+ * offset is after its last complete newline-terminated record.
+ */
+// Same-size replacement/rotation is out of scope: Claude/OMP transcripts append in place and new sessions use a new path.
+// OMP's open-file identity is verified separately by device and inode.
+export async function readLastMatchingRecordBefore(
+  path: string,
+  endOffset: number,
+  matches: (record: Record<string, unknown>) => boolean,
+): Promise<{ record: Record<string, unknown> | null; completeOffset: number } | null> {
+  const file = await open(path, "r").catch(() => null);
+  if (!file) return null;
+
+  try {
+    const { size } = await file.stat();
+    if (size < endOffset || statSync(path).size < endOffset) return null;
+
+    let position = endOffset;
+    let completeOffset = 0;
+    let foundCompleteBoundary = false;
+    let record: Record<string, unknown> | null = null;
+    let fragments: Buffer[] = [];
+    let fragmentBytes = 0;
+    const lineParts: Buffer[] = [];
+    while (position > 0 && record === null) {
+      const start = Math.max(0, position - BACKWARD_SCAN_CHUNK_SIZE);
+      const bytes = Buffer.allocUnsafe(position - start);
+      let used = 0;
+      while (used < bytes.length) {
+        const result = await file.read(bytes, used, bytes.length - used, start + used);
+        if (result.bytesRead === 0) return null;
+        used += result.bytesRead;
+      }
+
+      let right = bytes.length;
+      if (!foundCompleteBoundary) {
+        const lastNewline = bytes.lastIndexOf(0x0a);
+        if (bytes[bytes.length - 1] === 0x0a) {
+          completeOffset = start + bytes.length;
+          right -= 1;
+          foundCompleteBoundary = true;
+        } else if (lastNewline !== -1) {
+          completeOffset = start + lastNewline + 1;
+          right = lastNewline;
+          foundCompleteBoundary = true;
+        } else {
+          // No complete record yet; the trailing partial may span more chunks.
+          position = start;
+          continue;
+        }
+      }
+
+      while (right > 0) {
+        const previousNewline = bytes.lastIndexOf(0x0a, right - 1);
+        const lineStart = previousNewline + 1;
+        const fragment = bytes.subarray(lineStart, right);
+        if (previousNewline === -1 && start > 0) {
+          if (fragment.length > 0) {
+            fragments.push(fragment);
+            fragmentBytes += fragment.length;
+          }
+          break;
+        }
+
+        if (fragment.length > 0 || fragments.length > 0) {
+          let line = fragment;
+          if (fragments.length > 0) {
+            lineParts.length = 0;
+            lineParts.push(fragment);
+            while (fragments.length > 0) lineParts.push(fragments.pop()!);
+            line = Buffer.concat(lineParts, fragment.length + fragmentBytes);
+            lineParts.length = 0;
+          }
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(line.toString("utf8")) as unknown;
+          } catch {
+            parsed = null;
+          }
+          if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+            const candidate = parsed as Record<string, unknown>;
+            if (matches(candidate)) {
+              record = candidate;
+              break;
+            }
+          }
+        }
+
+        fragments.length = 0;
+        fragmentBytes = 0;
+        if (previousNewline === -1) {
+          right = 0;
+          break;
+        }
+        right = previousNewline;
+      }
+
+      position = start;
+    }
+
+    if ((await file.stat()).size < endOffset || statSync(path).size < endOffset) return null;
+    return { record, completeOffset: foundCompleteBoundary ? completeOffset : 0 };
+  } catch {
+    return null;
   } finally {
     await file.close().catch(() => {});
   }

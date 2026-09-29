@@ -15,7 +15,7 @@ import type { Pairing } from "./pairing.js";
 import type { MessageHandle, Notifier } from "./notifier.js";
 import { claudeDriver } from "./agents/claude/driver.js";
 import { WrittenFileTracker } from "./attachments.js";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -230,6 +230,108 @@ function adopt(engine: TurnEngine, pairing: Pairing, backend: BackendName = "her
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
+
+// Synthetic Claude transcript records for lifecycle tests; no CLI is invoked.
+function completedClaudeTurn(startedAt: string, text: string): Array<Record<string, unknown>> {
+  const start = Date.parse(startedAt);
+  return [
+    {
+      type: "user",
+      timestamp: new Date(start).toISOString(),
+      message: { role: "user", content: "continue" },
+    },
+    {
+      type: "assistant",
+      timestamp: new Date(start + 1_000).toISOString(),
+      message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text }] },
+    },
+    {
+      type: "system",
+      subtype: "turn_duration",
+      timestamp: new Date(start + 2_000).toISOString(),
+      durationMs: 1_000,
+    },
+  ];
+}
+
+function writeClaudeTurn(path: string, startedAt: string, text: string, append = false): void {
+  const data = `${completedClaudeTurn(startedAt, text).map((record) => JSON.stringify(record)).join("\n")}\n`;
+  if (append) appendFileSync(path, data);
+  else writeFileSync(path, data);
+}
+
+test("an accepted Orca turn ignores a historical completion until its own transcript boundary", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "cctag-orca-stale-end-"));
+  const sessionId = "session-stale-end";
+  const transcriptPath = claudeDriver.locateTranscript(cwd, sessionId);
+  assert.ok(transcriptPath);
+  const transcriptDir = dirname(transcriptPath);
+  mkdirSync(transcriptDir, { recursive: true });
+  writeClaudeTurn(transcriptPath, "2026-09-28T10:00:00.000Z", "old transcript output");
+
+  const target = `orca:${PANE}`;
+  const pairing: Pairing = { ...fakePairing(), paneId: target, backend: "orca" };
+  const { notifier, posts, updates } = fakeNotifier();
+  let submitted = false;
+  let pollCount = 0;
+  let seeFirstPoll!: () => void;
+  const firstPoll = new Promise<void>((resolve) => (seeFirstPoll = resolve));
+  const terminals = fakeBackend(
+    () => "working",
+    () => "",
+    {
+      async get(receivedTarget) {
+        if (submitted && pollCount++ === 0) seeFirstPoll();
+        return {
+          ...fakeAgent(submitted ? "working" : "idle", "orca"),
+          ref: { target: receivedTarget, pid: 42, processStartedAt: 1 },
+          sessionId,
+          cwd,
+          evidence: { kind: "hint", state: "done", waitingSince: null },
+        };
+      },
+      async submit() {
+        submitted = true;
+        return "accepted";
+      },
+    },
+    "orca",
+  );
+  const engine = new TurnEngine(
+    terminals,
+    notifier,
+    { turnTimeoutMs: 600_000, pollIntervalMs: 100, limits: { maxFileBytes: 1024, maxFileCount: 1 } },
+    { list: () => [pairing] },
+  );
+
+  try {
+    await engine.startTurn(pairing, "U1", "new prompt");
+    await firstPoll;
+    await sleep(20); // Let that poll resolve, but stay before the next interval.
+
+    assert.ok(updates.some(({ text }) => text.includes("orca は入力を受け付けました")));
+    assert.equal(engine.isBusy(target), true, "a historical completion and done hint must not release a fresh turn");
+    assert.equal(
+      updates.some(({ text }) => text.startsWith("✅")),
+      false,
+      "no completed status is posted before this turn writes a boundary",
+    );
+    assert.equal(posts.some((post) => post.includes("old transcript output")), false);
+
+    writeClaudeTurn(transcriptPath, "2026-09-28T10:00:05.000Z", "new turn response", true);
+    for (let i = 0; i < 50; i++) {
+      if (!engine.isBusy(target) && posts.join("\n").includes("new turn response")) break;
+      await sleep(20);
+    }
+
+    assert.equal(engine.isBusy(target), false, "the newly observed completion should release the turn");
+    assert.ok(posts.some((post) => post.includes("new turn response")), JSON.stringify(posts));
+  } finally {
+    engine.abortAll();
+    rmSync(transcriptDir, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
 
 test("a new session does not inherit a blocked status on an incomplete screen", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "cctag-session-reset-"));

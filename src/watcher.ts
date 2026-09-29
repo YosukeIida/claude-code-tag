@@ -6,7 +6,14 @@ import type { TurnEngine } from "./turn.js";
 import type { Notifier } from "./notifier.js";
 import { snapshotOutbox, WrittenFileTracker, type DirSnapshot } from "./attachments.js";
 import { postSegmented } from "./slack/post.js";
-import { readNewRecords, readRecentRecords, transcriptCreatedAfter, transcriptSizeSafe } from "./agents/transcript.js";
+import {
+  readLastMatchingRecordBefore,
+  readNewRecords,
+  readRecentRecords,
+  transcriptCreatedAfter,
+  transcriptSizeIfAvailable,
+  transcriptSizeSafe,
+} from "./agents/transcript.js";
 import { driverFor } from "./agents/driver.js";
 import { classifiedStatus, EMPTY_TRANSCRIPT_BOUNDARIES, resolveStatus, SettleTracker, transcriptBoundaries } from "./settle.js";
 import { promptFingerprint } from "./agents/fingerprint.js";
@@ -101,6 +108,8 @@ export class BackgroundWatcher {
     private readonly intervalMs = 7_000,
     /** Overridable for tests only — production always wants AGENTLESS_GRACE_MS. */
     private readonly agentlessGraceMs = AGENTLESS_GRACE_MS,
+    /** Test barrier for appends between the captured EOF and its lifecycle read. */
+    private readonly beforeBaselineRead?: (path: string, offset: number) => Promise<void>,
   ) {}
 
   start(): void {
@@ -284,14 +293,45 @@ export class BackgroundWatcher {
 
     if (!existing || existing.pairingKey !== pairing.key || sessionRotated || forceRebaseline) {
       const tPath = driver.locateTranscript(agent.cwd, agent.sessionId) ?? "";
+      const capturedOffset =
+        tPath && !transcriptAppeared
+          ? agent.evidence.kind === "hint"
+            ? transcriptSizeIfAvailable(tPath)
+            : transcriptSizeSafe(tPath)
+          : 0;
+      // A failed stat is not an empty baseline. Keep an existing hint watch intact and retry next tick.
+      if (capturedOffset === null) return;
+      let offset = capturedOffset;
+      const settle = new SettleTracker();
+      let initialStatus = classifiedStatus(agent.evidence);
+      if (agent.evidence.kind === "hint" && tPath && !transcriptAppeared) {
+        if (this.beforeBaselineRead) await this.beforeBaselineRead(tPath, capturedOffset);
+        // Scan only complete records at the captured EOF. A partial trailing
+        // record stays at the output offset so it is parsed in full on completion.
+        const baseline = await readLastMatchingRecordBefore(tPath, capturedOffset, (record) =>
+          driver.extractLifecycle([record]).length > 0,
+        );
+        if (!baseline) {
+          const currentSize = transcriptSizeIfAvailable(tPath);
+          if (currentSize !== null && currentSize < capturedOffset) this.watches.delete(pairing.paneId);
+          return;
+        }
+        offset = baseline.completeOffset;
+        const boundaries = baseline.record
+          ? transcriptBoundaries(driver.extractLifecycle([baseline.record]))
+          : EMPTY_TRANSCRIPT_BOUNDARIES;
+        if (boundaries.lastBoundary === "started") {
+          settle.markTurnRunning();
+          initialStatus = "working";
+        }
+      }
       this.watches.set(pairing.paneId, {
         pairingKey: pairing.key,
         sessionId,
         transcriptPath: tPath,
-        // Normally the end of the file: on first sight, on resuming after a turn,
-        // and on a restart, whatever is already written either predates watching
-        // or was already reported, and replaying it would dump an old session
-        // into the thread.
+        // Normally the captured end of the file (the last complete record for
+        // hint evidence): existing output either predates watching or was already
+        // reported, and replaying it would dump an old session into the thread.
         //
         // The exception is a transcript that only just came into existence. Codex
         // creates its rollout file lazily — not at launch, but when a turn first
@@ -299,20 +339,37 @@ export class BackgroundWatcher {
         // would silently drop that entire first turn rather than a few seconds of
         // it. Nothing in the file can predate watching, so reading it whole is
         // both safe and the only way that turn reaches Slack.
-        offset: tPath && !transcriptAppeared ? transcriptSizeSafe(tPath) : 0,
+        offset,
         startedAt: Date.now(),
-        lastStatus: classifiedStatus(agent.evidence),
+        lastStatus: initialStatus,
         collected: [],
         outboxBaseline: snapshotOutbox(agent.cwd),
         writes: new WrittenFileTracker(),
-        settle: new SettleTracker(),
+        settle,
       });
       return;
     }
 
     const state = existing;
+    let sawStartThisTick = false;
+    let sawCompletionThisTick = false;
     if (state.transcriptPath) {
-      const { records, newOffset } = await readNewRecords(state.transcriptPath, state.offset);
+      const previousOffset = state.offset;
+      if (agent.evidence.kind === "hint") {
+        const currentSize = transcriptSizeIfAvailable(state.transcriptPath);
+        if (currentSize !== null && currentSize < previousOffset) {
+          this.watches.delete(pairing.paneId);
+          return;
+        }
+      }
+      const { records, newOffset } = await readNewRecords(state.transcriptPath, previousOffset);
+      if (agent.evidence.kind === "hint") {
+        const currentSize = transcriptSizeIfAvailable(state.transcriptPath);
+        if (currentSize !== null && currentSize < newOffset) {
+          this.watches.delete(pairing.paneId);
+          return;
+        }
+      }
       state.offset = newOffset;
       const output = driver.extractTurnOutput(records);
       state.collected.push(...output.texts);
@@ -320,7 +377,10 @@ export class BackgroundWatcher {
       // is only ever seen by this loop, and if it later blocks, the write it
       // already completed has to survive into the adopted turn.
       state.writes.ingest(output);
-      state.settle.observe(output.lifecycle ?? []);
+      const lifecycle = output.lifecycle ?? [];
+      sawStartThisTick = lifecycle.some((event) => event.kind === "started");
+      sawCompletionThisTick = lifecycle.some((event) => event.kind !== "started");
+      state.settle.observe(lifecycle);
     }
 
     // Both status paths use this resolver: herdr keeps the existing settle
@@ -369,7 +429,13 @@ export class BackgroundWatcher {
       return;
     }
 
-    const wasActive = previousStatus === "working" || previousStatus === "blocked";
+    const completedInOnePoll =
+      agent.evidence.kind === "hint" &&
+      sawStartThisTick &&
+      sawCompletionThisTick &&
+      state.settle.settledByTranscript;
+    const wasActive =
+      previousStatus === "working" || previousStatus === "blocked" || completedInOnePoll;
     const nowSettled = status === "idle" || status === "done";
 
     if (wasActive && nowSettled) {

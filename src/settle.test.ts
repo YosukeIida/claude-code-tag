@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EMPTY_TRANSCRIPT_BOUNDARIES, resolveStatus, SettleTracker, transcriptBoundaries } from "./settle.js";
-import { readNewRecords, readRecentRecords } from "./agents/transcript.js";
+import { readLastMatchingRecordBefore, readNewRecords, readRecentRecords } from "./agents/transcript.js";
 import { extractLifecycle, type TranscriptRecord } from "./agents/claude/transcript.js";
 
 // --- the tracker itself -----------------------------------------------------
@@ -293,14 +293,27 @@ test("a running transcript uses a complete screen fingerprint to distinguish blo
 });
 
 test("a transcript end newer than waitingSince resolves to idle", async () => {
+  const settle = new SettleTracker();
+  settle.observe(V2_LIFECYCLE);
   const resolved = await resolveStatus({
     evidence: hint("working", Math.floor((V2_START_AT + V2_END_AT) / 2)),
-    settle: new SettleTracker(),
+    settle,
     boundaries: transcriptBoundaries(V2_LIFECYCLE),
     previousStatus: "working",
   });
   assert.equal(resolved.status, "idle");
   assert.equal(resolved.extendDeadline, false);
+});
+
+test("a historical transcript end before waitingSince still blocks", async () => {
+  const resolved = await resolveStatus({
+    evidence: hint("waiting", V2_END_AT + 1),
+    settle: new SettleTracker(),
+    boundaries: transcriptBoundaries(V2_LIFECYCLE),
+    previousStatus: "working",
+  });
+  assert.equal(resolved.status, "blocked");
+  assert.equal(resolved.extendDeadline, true);
 });
 
 test("an unknown end timestamp cannot release a waiting hint", async () => {
@@ -375,6 +388,29 @@ test("recent transcript reads handle cut records, exact record edges, and short 
 
     writeFileSync(shortPath, `${JSON.stringify({ id: "short" })}\n`);
     assert.deepEqual(await readRecentRecords(shortPath), [{ id: "short" }]);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("lifecycle baselines join multi-chunk records and leave partial tails readable", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "cctag-transcript-baseline-"));
+  const path = join(directory, "session.jsonl");
+  const started = JSON.stringify({ id: "start", type: "user" });
+  const large = JSON.stringify({ id: "large", padding: "x".repeat(128 * 1024) });
+  const partial = JSON.stringify({ id: "post-baseline" });
+  const splitAt = Math.floor(partial.length / 2);
+  const captured = `${started}\n${large}\n${partial.slice(0, splitAt)}`;
+  writeFileSync(path, captured);
+  try {
+    const baseline = await readLastMatchingRecordBefore(path, statSync(path).size, (record) => record.id === "start");
+    assert.ok(baseline);
+    assert.deepEqual(baseline.record, JSON.parse(started));
+    assert.equal(baseline.completeOffset, Buffer.byteLength(`${started}\n${large}\n`));
+
+    writeFileSync(path, `${captured}${partial.slice(splitAt)}\n`);
+    const tail = await readNewRecords(path, baseline.completeOffset);
+    assert.deepEqual(tail.records, [JSON.parse(partial)]);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

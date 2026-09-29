@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { BackgroundWatcher } from "./watcher.js";
@@ -95,15 +95,17 @@ function orcaPairing(): Pairing {
   return { ...fakePairing(), key: "C1:2.1", threadTs: "2.1", paneId: ORCA_PANE, backend: "orca" };
 }
 
-function fakeNotifier(): { notifier: Notifier; replies: string[] } {
+function fakeNotifier(onPost?: (text: string) => void): { notifier: Notifier; replies: string[] } {
   const replies: string[] = [];
   const handle: MessageHandle = { async update() {} };
   const notifier: Notifier = {
     async postReply(_c, _t, text) {
       replies.push(text);
+      onPost?.(text);
     },
     async postMessage(_c, _t, text) {
       replies.push(text);
+      onPost?.(text);
       return handle;
     },
   };
@@ -122,6 +124,42 @@ function storeWithPairing(dir: string, pairing: Pairing = fakePairing()): Pairin
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+function fakeOrcaHintAgent(cwd: string): AgentInfo {
+  return {
+    ...fakeAgent("working", cwd),
+    ref: { target: ORCA_PANE, pid: 42, processStartedAt: 1 },
+    backend: "orca",
+    sessionId: "session-a",
+    evidence: { kind: "hint", state: "working", waitingSince: null },
+  };
+}
+
+function fakeOrcaTurnEngine(): TurnEngine {
+  return {
+    ...idleEngine,
+    async uploadOutboxAdditions(...args: Parameters<TurnEngine["uploadOutboxAdditions"]>) {
+      return args[2];
+    },
+  } as unknown as TurnEngine;
+}
+
+async function waitForSignal(signal: Promise<void>, description: string): Promise<void> {
+  await Promise.race([
+    signal,
+    sleep(500).then(() => {
+      throw new Error(`timed out waiting for ${description}`);
+    }),
+  ]);
+}
+
 
 test("a pane that has gone away is reported once and unpaired", async () => {
   // Closing the terminal used to be undetectable from Slack: the watcher
@@ -309,8 +347,8 @@ function writeTranscript(dir: string, name: string, texts: string[]): void {
   writeFileSync(join(dir, name), lines.join("\n") + "\n");
 }
 
-/** A transcript holding one complete turn: a real user message, the assistant's
- *  reply, and the `turn_duration` record the CLI closes a turn with. */
+/** Synthetic Claude transcript fixture: a user message, assistant reply, and
+ *  `turn_duration` record. */
 function writeCompletedTurn(dir: string, name: string, text: string): void {
   mkdirSync(dir, { recursive: true });
   const lines = [
@@ -323,6 +361,63 @@ function writeCompletedTurn(dir: string, name: string, text: string): void {
     { type: "system", subtype: "turn_duration", timestamp: "2026-09-27T14:49:01.083Z", durationMs: 1234 },
   ].map((r) => JSON.stringify(r));
   writeFileSync(join(dir, name), lines.join("\n") + "\n");
+}
+
+
+// Synthetic transcript records for a terminal turn that straddles watcher startup.
+function writeStartedTurn(dir: string, name: string): void {
+  mkdirSync(dir, { recursive: true });
+  const lines = [
+    {
+      type: "user",
+      timestamp: "2026-09-27T14:48:48.520Z",
+      message: { role: "user", content: "やって" },
+    },
+    {
+      type: "assistant",
+      timestamp: "2026-09-27T14:48:53.416Z",
+      message: { role: "assistant", content: [{ type: "text", text: "before EOF baseline" }] },
+    },
+  ].map((record) => JSON.stringify(record));
+  writeFileSync(join(dir, name), `${lines.join("\n")}\n`);
+}
+
+function appendCompletedResponse(dir: string, name: string, text: string): void {
+  const lines = [
+    {
+      type: "assistant",
+      timestamp: "2026-09-27T14:49:00.000Z",
+      message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text }] },
+    },
+    { type: "system", subtype: "turn_duration", timestamp: "2026-09-27T14:49:01.000Z", durationMs: 1_000 },
+  ].map((record) => JSON.stringify(record));
+  appendFileSync(join(dir, name), `${lines.join("\n")}\n`);
+}
+
+function appendStartedTurn(dir: string, name: string, text: string): void {
+  const lines = [
+    {
+      type: "user",
+      timestamp: "2026-09-27T14:50:00.000Z",
+      message: { role: "user", content: "次を続けて" },
+    },
+    {
+      type: "assistant",
+      timestamp: "2026-09-27T14:50:03.000Z",
+      message: { role: "assistant", content: [{ type: "text", text }] },
+    },
+  ].map((record) => JSON.stringify(record));
+  appendFileSync(join(dir, name), `${lines.join("\n")}\n`);
+}
+
+function appendTurnCompletion(dir: string, name: string): void {
+  const record = {
+    type: "system",
+    subtype: "turn_duration",
+    timestamp: "2026-09-27T14:50:04.000Z",
+    durationMs: 1_000,
+  };
+  appendFileSync(join(dir, name), `${JSON.stringify(record)}\n`);
 }
 
 /** A pane reporting no session id, whose status the test can flip. */
@@ -449,6 +544,840 @@ test("a pane herdr reports as working forever still gets its terminal-side respo
     assert.equal(replies.filter((r) => r.includes("ターミナル側で書いた結果")).length, 1, "must not re-report");
   });
 });
+
+test("an Orca watcher reports a turn that began before its EOF baseline when it later completes", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "cctag-orca-watch-baseline-"));
+  const transcriptDir = transcriptDirFor(cwd);
+  const storeDir = mkdtempSync(join(tmpdir(), "cctag-orca-watch-store-"));
+  const transcriptName = "session-a.jsonl";
+  let watcher: BackgroundWatcher | undefined;
+  try {
+    writeStartedTurn(transcriptDir, transcriptName);
+    const pairing = { ...orcaPairing(), cwd };
+    const store = storeWithPairing(storeDir, pairing);
+    const { notifier, replies } = fakeNotifier();
+    const agent: AgentInfo = {
+      ...fakeAgent("working", cwd),
+      ref: { target: ORCA_PANE, pid: 42, processStartedAt: 1 },
+      backend: "orca",
+      sessionId: "session-a",
+      evidence: { kind: "hint", state: "working", waitingSince: null },
+    };
+    const turnEngine = {
+      ...idleEngine,
+      async uploadOutboxAdditions(...args: Parameters<TurnEngine["uploadOutboxAdditions"]>) {
+        return args[2];
+      },
+    } as unknown as TurnEngine;
+    watcher = new BackgroundWatcher("orca", fakeTerminals(() => agent), store, turnEngine, notifier, 20);
+    watcher.start();
+    await sleep(80); // The watcher has baselined at EOF and observed the existing start.
+
+    assert.equal(replies.some((reply) => reply.includes("before EOF baseline")), false);
+    appendCompletedResponse(transcriptDir, transcriptName, "watcher response after baseline");
+    for (let i = 0; i < 30 && !replies.some((reply) => reply.includes("watcher response after baseline")); i++) {
+      await sleep(20);
+    }
+
+    assert.equal(
+      replies.filter((reply) => reply.includes("watcher response after baseline")).length,
+      1,
+      `the post-baseline completion should report only new output, got ${JSON.stringify(replies)}`,
+    );
+  } finally {
+    watcher?.stop();
+    rmSync(transcriptDir, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(storeDir, { recursive: true, force: true });
+  }
+});
+
+test("an Orca watcher does not settle from a completion before its EOF baseline", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "cctag-orca-watch-stale-end-"));
+  const transcriptDir = transcriptDirFor(cwd);
+  const storeDir = mkdtempSync(join(tmpdir(), "cctag-orca-watch-store-"));
+  const transcriptName = "session-a.jsonl";
+  let watcher: BackgroundWatcher | undefined;
+  try {
+    writeCompletedTurn(transcriptDir, transcriptName, "old watcher history");
+    const pairing = { ...orcaPairing(), cwd };
+    const store = storeWithPairing(storeDir, pairing);
+    const { notifier, replies } = fakeNotifier();
+    const agent: AgentInfo = {
+      ...fakeAgent("working", cwd),
+      ref: { target: ORCA_PANE, pid: 42, processStartedAt: 1 },
+      backend: "orca",
+      sessionId: "session-a",
+      evidence: { kind: "hint", state: "working", waitingSince: null },
+    };
+    const turnEngine = {
+      ...idleEngine,
+      async uploadOutboxAdditions(...args: Parameters<TurnEngine["uploadOutboxAdditions"]>) {
+        return args[2];
+      },
+    } as unknown as TurnEngine;
+    watcher = new BackgroundWatcher("orca", fakeTerminals(() => agent), store, turnEngine, notifier, 20);
+    watcher.start();
+    await sleep(80); // The old completion and its output are before the EOF baseline.
+
+    assert.equal(replies.some((reply) => reply.includes("old watcher history")), false);
+    appendStartedTurn(transcriptDir, transcriptName, "new watcher turn");
+    await sleep(80); // Let the watcher observe the new start while it is still running.
+    assert.equal(replies.some((reply) => reply.includes("new watcher turn")), false);
+    appendTurnCompletion(transcriptDir, transcriptName);
+    for (let i = 0; i < 30 && !replies.some((reply) => reply.includes("new watcher turn")); i++) {
+      await sleep(20);
+    }
+
+    assert.equal(
+      replies.filter((reply) => reply.includes("new watcher turn")).length,
+      1,
+      `only the post-baseline turn should be reported, got ${JSON.stringify(replies)}`,
+    );
+  } finally {
+    watcher?.stop();
+    rmSync(transcriptDir, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(storeDir, { recursive: true, force: true });
+  }
+});
+
+// These watcher-loop integration tests have no manual tick trigger; short real
+// poll intervals launch each tick, while deferred terminal reads control races.
+test("an Orca watcher finds a baseline start beyond both bounded suffix limits", { timeout: 10_000 }, async (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), "cctag-orca-watch-long-start-"));
+  const transcriptDir = transcriptDirFor(cwd);
+  const storeDir = mkdtempSync(join(tmpdir(), "cctag-orca-watch-store-"));
+  const transcriptName = "session-a.jsonl";
+  const transcriptPath = join(transcriptDir, transcriptName);
+  let watcher: BackgroundWatcher | undefined;
+  t.after(() => {
+    watcher?.stop();
+    rmSync(transcriptDir, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(storeDir, { recursive: true, force: true });
+  });
+  try {
+    writeStartedTurn(transcriptDir, transcriptName);
+    const history = Array.from({ length: 300 }, (_, i) =>
+      JSON.stringify({
+        type: "user",
+        timestamp: "2026-09-27T14:48:54.000Z",
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: `tool-${i}`, content: "x".repeat(1_024) }],
+        },
+      }),
+    ).join("\n");
+    assert.ok(Buffer.byteLength(history) > 256 * 1024);
+    appendFileSync(transcriptPath, `${history}\n`);
+
+    const agent: AgentInfo = {
+      ...fakeAgent("working", cwd),
+      ref: { target: ORCA_PANE, pid: 42, processStartedAt: 1 },
+      backend: "orca",
+      sessionId: "session-a",
+      evidence: { kind: "hint", state: "working", waitingSince: null },
+    };
+    const pairing = { ...orcaPairing(), cwd };
+    const store = storeWithPairing(storeDir, pairing);
+    const posted = deferred();
+    const { notifier, replies } = fakeNotifier((text) => {
+      if (text.includes("long-turn response")) posted.resolve();
+    });
+    const thirdTick = deferred();
+    let getCount = 0;
+    const terminals = fakeTerminals(() => {
+      getCount += 1;
+      if (getCount === 3) thirdTick.resolve();
+      return agent;
+    });
+    const turnEngine = {
+      ...idleEngine,
+      async uploadOutboxAdditions(...args: Parameters<TurnEngine["uploadOutboxAdditions"]>) {
+        return args[2];
+      },
+    } as unknown as TurnEngine;
+    watcher = new BackgroundWatcher("orca", terminals, store, turnEngine, notifier, 10);
+    watcher.start();
+
+    await thirdTick.promise;
+    appendCompletedResponse(transcriptDir, transcriptName, "long-turn response");
+    await posted.promise;
+
+    assert.equal(replies.filter((reply) => reply.includes("long-turn response")).length, 1);
+    assert.equal(replies.some((reply) => reply.includes("before EOF baseline")), false);
+  } finally {
+    watcher?.stop();
+    rmSync(transcriptDir, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(storeDir, { recursive: true, force: true });
+  }
+});
+
+test("an Orca watcher reads the baseline at its captured offset", { timeout: 10_000 }, async (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), "cctag-orca-watch-baseline-race-"));
+  const transcriptDir = transcriptDirFor(cwd);
+  const storeDir = mkdtempSync(join(tmpdir(), "cctag-orca-watch-store-"));
+  const transcriptName = "session-a.jsonl";
+  const transcriptPath = join(transcriptDir, transcriptName);
+  const baselineReadEntered = deferred();
+  const releaseBaselineRead = deferred();
+  let capturedOffset = -1;
+  let watcher: BackgroundWatcher | undefined;
+  t.after(() => {
+    releaseBaselineRead.resolve();
+    watcher?.stop();
+    rmSync(transcriptDir, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(storeDir, { recursive: true, force: true });
+  });
+  try {
+    writeStartedTurn(transcriptDir, transcriptName);
+    const expectedOffset = statSync(transcriptPath).size;
+    const agent: AgentInfo = {
+      ...fakeAgent("working", cwd),
+      ref: { target: ORCA_PANE, pid: 42, processStartedAt: 1 },
+      backend: "orca",
+      sessionId: "session-a",
+      evidence: { kind: "hint", state: "working", waitingSince: null },
+    };
+    const pairing = { ...orcaPairing(), cwd };
+    const store = storeWithPairing(storeDir, pairing);
+    const posted = deferred();
+    const { notifier, replies } = fakeNotifier((text) => {
+      if (text.includes("raced baseline response")) posted.resolve();
+    });
+    const turnEngine = {
+      ...idleEngine,
+      async uploadOutboxAdditions(...args: Parameters<TurnEngine["uploadOutboxAdditions"]>) {
+        return args[2];
+      },
+    } as unknown as TurnEngine;
+    watcher = new BackgroundWatcher(
+      "orca",
+      fakeTerminals(() => agent),
+      store,
+      turnEngine,
+      notifier,
+      10,
+      undefined,
+      async (_path, offset) => {
+        capturedOffset = offset;
+        baselineReadEntered.resolve();
+        await releaseBaselineRead.promise;
+      },
+    );
+    watcher.start();
+
+    await baselineReadEntered.promise;
+    assert.equal(capturedOffset, expectedOffset);
+    appendCompletedResponse(transcriptDir, transcriptName, "raced baseline response");
+    releaseBaselineRead.resolve();
+    await posted.promise;
+
+    assert.equal(replies.filter((reply) => reply.includes("raced baseline response")).length, 1);
+    assert.equal(replies.some((reply) => reply.includes("before EOF baseline")), false);
+  } finally {
+    releaseBaselineRead.resolve();
+    watcher?.stop();
+    rmSync(transcriptDir, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(storeDir, { recursive: true, force: true });
+  }
+});
+
+test("an Orca watcher reads a start record split at its baseline", { timeout: 10_000 }, async (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), "cctag-orca-watch-split-start-"));
+  const transcriptDir = transcriptDirFor(cwd);
+  const storeDir = mkdtempSync(join(tmpdir(), "cctag-orca-watch-store-"));
+  const transcriptName = "session-a.jsonl";
+  const transcriptPath = join(transcriptDir, transcriptName);
+  const baselineReadEntered = deferred();
+  const releaseBaselineRead = deferred();
+  const posted = deferred();
+  let capturedOffset = -1;
+  let watcher: BackgroundWatcher | undefined;
+  t.after(() => {
+    releaseBaselineRead.resolve();
+    watcher?.stop();
+    rmSync(transcriptDir, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(storeDir, { recursive: true, force: true });
+  });
+
+  mkdirSync(transcriptDir, { recursive: true });
+  const priorRecord = JSON.stringify({
+    type: "assistant",
+    message: { role: "assistant", content: [{ type: "text", text: "old baseline output" }] },
+  });
+  const startRecord = JSON.stringify({
+    type: "user",
+    timestamp: "2026-09-27T14:50:00.000Z",
+    message: { role: "user", content: "次を続けて" },
+  });
+  const splitAt = Math.floor(startRecord.length / 2);
+  writeFileSync(transcriptPath, `${priorRecord}\n${startRecord.slice(0, splitAt)}`);
+  const expectedOffset = statSync(transcriptPath).size;
+  const agent = fakeOrcaHintAgent(cwd);
+  const store = storeWithPairing(storeDir, { ...orcaPairing(), cwd });
+  const { notifier, replies } = fakeNotifier((text) => {
+    if (text.includes("split-start response")) posted.resolve();
+  });
+  watcher = new BackgroundWatcher(
+    "orca",
+    fakeTerminals(() => agent),
+    store,
+    fakeOrcaTurnEngine(),
+    notifier,
+    10,
+    undefined,
+    async (_path, offset) => {
+      capturedOffset = offset;
+      baselineReadEntered.resolve();
+      await releaseBaselineRead.promise;
+    },
+  );
+  watcher.start();
+
+  await waitForSignal(baselineReadEntered.promise, "the split-start baseline barrier");
+  assert.equal(capturedOffset, expectedOffset);
+  appendFileSync(transcriptPath, `${startRecord.slice(splitAt)}\n`);
+  appendCompletedResponse(transcriptDir, transcriptName, "split-start response");
+  releaseBaselineRead.resolve();
+  await waitForSignal(posted.promise, "the split-start response");
+
+  assert.equal(replies.filter((reply) => reply.includes("split-start response")).length, 1);
+  assert.equal(replies.some((reply) => reply.includes("old baseline output")), false);
+});
+
+test("an Orca watcher reads a completion record split at its baseline", { timeout: 10_000 }, async (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), "cctag-orca-watch-split-end-"));
+  const transcriptDir = transcriptDirFor(cwd);
+  const storeDir = mkdtempSync(join(tmpdir(), "cctag-orca-watch-store-"));
+  const transcriptName = "session-a.jsonl";
+  const transcriptPath = join(transcriptDir, transcriptName);
+  const baselineReadEntered = deferred();
+  const releaseBaselineRead = deferred();
+  const posted = deferred();
+  let capturedOffset = -1;
+  let watcher: BackgroundWatcher | undefined;
+  t.after(() => {
+    releaseBaselineRead.resolve();
+    watcher?.stop();
+    rmSync(transcriptDir, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(storeDir, { recursive: true, force: true });
+  });
+
+  writeStartedTurn(transcriptDir, transcriptName);
+  const completionRecord = JSON.stringify({
+    type: "assistant",
+    timestamp: "2026-09-27T14:50:04.000Z",
+    message: {
+      role: "assistant",
+      stop_reason: "end_turn",
+      content: [{ type: "text", text: "split-completion response" }],
+    },
+  });
+  const splitAt = Math.floor(completionRecord.length / 2);
+  appendFileSync(transcriptPath, completionRecord.slice(0, splitAt));
+  const expectedOffset = statSync(transcriptPath).size;
+  const agent = fakeOrcaHintAgent(cwd);
+  const store = storeWithPairing(storeDir, { ...orcaPairing(), cwd });
+  const { notifier, replies } = fakeNotifier((text) => {
+    if (text.includes("split-completion response")) posted.resolve();
+  });
+  watcher = new BackgroundWatcher(
+    "orca",
+    fakeTerminals(() => agent),
+    store,
+    fakeOrcaTurnEngine(),
+    notifier,
+    10,
+    undefined,
+    async (_path, offset) => {
+      capturedOffset = offset;
+      baselineReadEntered.resolve();
+      await releaseBaselineRead.promise;
+    },
+  );
+  watcher.start();
+
+  await waitForSignal(baselineReadEntered.promise, "the split-completion baseline barrier");
+  assert.equal(capturedOffset, expectedOffset);
+  appendFileSync(transcriptPath, `${completionRecord.slice(splitAt)}\n`);
+  releaseBaselineRead.resolve();
+  await waitForSignal(posted.promise, "the split-completion response");
+
+  assert.equal(replies.filter((reply) => reply.includes("split-completion response")).length, 1);
+  assert.equal(replies.some((reply) => reply.includes("before EOF baseline")), false);
+});
+
+for (const mutation of ["truncation", "short replacement"] as const) {
+  test(`an Orca watcher rebaselines after ${mutation} during lifecycle scanning`, { timeout: 10_000 }, async (t) => {
+    const cwd = mkdtempSync(join(tmpdir(), `cctag-orca-watch-baseline-${mutation.replace(" ", "-")}-`));
+    const transcriptDir = transcriptDirFor(cwd);
+    const storeDir = mkdtempSync(join(tmpdir(), "cctag-orca-watch-store-"));
+    const transcriptName = "session-a.jsonl";
+    const transcriptPath = join(transcriptDir, transcriptName);
+    const baselineReadEntered = deferred();
+    const releaseBaselineRead = deferred();
+    const rebaselineRead = deferred();
+    const startProcessed = deferred();
+    const posted = deferred();
+    let capturedOffset = -1;
+    let rebaselineOffset = -1;
+    let baselineReads = 0;
+    let getCount = 0;
+    let watcher: BackgroundWatcher | undefined;
+    t.after(() => {
+      releaseBaselineRead.resolve();
+      watcher?.stop();
+      rmSync(transcriptDir, { recursive: true, force: true });
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(storeDir, { recursive: true, force: true });
+    });
+
+    writeStartedTurn(transcriptDir, transcriptName);
+    appendFileSync(
+      transcriptPath,
+      `${JSON.stringify({
+        type: "user",
+        timestamp: "2026-09-27T14:49:00.000Z",
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "large", content: "x".repeat(4_096) }] },
+      })}\n`,
+    );
+    const agent = fakeOrcaHintAgent(cwd);
+    const store = storeWithPairing(storeDir, { ...orcaPairing(), cwd });
+    const { notifier, replies } = fakeNotifier((text) => {
+      if (text.includes("new post-rebaseline completion")) posted.resolve();
+    });
+    watcher = new BackgroundWatcher(
+      "orca",
+      fakeTerminals(() => {
+        getCount += 1;
+        if (getCount === 4) startProcessed.resolve();
+        return agent;
+      }),
+      store,
+      fakeOrcaTurnEngine(),
+      notifier,
+      10,
+      undefined,
+      async (_path, offset) => {
+        baselineReads += 1;
+        if (baselineReads === 1) {
+          capturedOffset = offset;
+          baselineReadEntered.resolve();
+          await releaseBaselineRead.promise;
+        } else if (baselineReads === 2) {
+          rebaselineOffset = offset;
+          rebaselineRead.resolve();
+        }
+      },
+    );
+    watcher.start();
+
+    await waitForSignal(baselineReadEntered.promise, "the original baseline barrier");
+    if (mutation === "truncation") {
+      writeFileSync(transcriptPath, "{}\n");
+    } else {
+      const replacementPath = join(transcriptDir, "replacement.jsonl");
+      writeCompletedTurn(transcriptDir, "replacement.jsonl", "replacement history");
+      assert.ok(statSync(replacementPath).size < capturedOffset);
+      renameSync(replacementPath, transcriptPath);
+    }
+    const replacementOffset = statSync(transcriptPath).size;
+    assert.ok(replacementOffset < capturedOffset);
+    releaseBaselineRead.resolve();
+    await waitForSignal(rebaselineRead.promise, "a fresh baseline after the shorter transcript");
+    assert.equal(rebaselineOffset, replacementOffset);
+
+    appendStartedTurn(transcriptDir, transcriptName, "new post-rebaseline turn");
+    await waitForSignal(startProcessed.promise, "the post-rebaseline start record");
+    assert.equal(replies.some((reply) => reply.includes("new post-rebaseline completion")), false);
+    appendCompletedResponse(transcriptDir, transcriptName, "new post-rebaseline completion");
+    await waitForSignal(posted.promise, "the post-rebaseline completion");
+
+    assert.equal(replies.filter((reply) => reply.includes("new post-rebaseline completion")).length, 1);
+    assert.equal(replies.some((reply) => reply.includes("replacement history")), false);
+    assert.equal(replies.some((reply) => reply.includes("before EOF baseline")), false);
+  });
+}
+
+test("an Orca watcher rebaselines when a later tick finds a shorter transcript", { timeout: 10_000 }, async (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), "cctag-orca-watch-later-shrink-"));
+  const transcriptDir = transcriptDirFor(cwd);
+  const storeDir = mkdtempSync(join(tmpdir(), "cctag-orca-watch-store-"));
+  const transcriptName = "session-a.jsonl";
+  const transcriptPath = join(transcriptDir, transcriptName);
+  const secondGet = deferred();
+  const releaseSecondGet = deferred();
+  const rebaselineRead = deferred();
+  const startProcessed = deferred();
+  const posted = deferred();
+  let baselineReads = 0;
+  let getCount = 0;
+  let watcher: BackgroundWatcher | undefined;
+  t.after(() => {
+    releaseSecondGet.resolve();
+    watcher?.stop();
+    rmSync(transcriptDir, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(storeDir, { recursive: true, force: true });
+  });
+
+  writeStartedTurn(transcriptDir, transcriptName);
+  appendFileSync(
+    transcriptPath,
+    `${JSON.stringify({
+      type: "user",
+      timestamp: "2026-09-27T14:49:00.000Z",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "large", content: "x".repeat(4_096) }] },
+    })}\n`,
+  );
+  const originalOffset = statSync(transcriptPath).size;
+  const agent = fakeOrcaHintAgent(cwd);
+  const store = storeWithPairing(storeDir, { ...orcaPairing(), cwd });
+  const { notifier, replies } = fakeNotifier((text) => {
+    if (text.includes("later post-rebaseline completion")) posted.resolve();
+  });
+  watcher = new BackgroundWatcher(
+    "orca",
+    fakeTerminals(async () => {
+      getCount += 1;
+      if (getCount === 2) {
+        secondGet.resolve();
+        await releaseSecondGet.promise;
+      }
+      if (getCount === 5) startProcessed.resolve();
+      return agent;
+    }),
+    store,
+    fakeOrcaTurnEngine(),
+    notifier,
+    10,
+    undefined,
+    async () => {
+      baselineReads += 1;
+      if (baselineReads === 2) rebaselineRead.resolve();
+    },
+  );
+  watcher.start();
+
+  await waitForSignal(secondGet.promise, "the first post-baseline tick");
+  writeFileSync(transcriptPath, "{}\n");
+  assert.ok(statSync(transcriptPath).size < originalOffset);
+  releaseSecondGet.resolve();
+  await waitForSignal(rebaselineRead.promise, "a fresh baseline after the later shrink");
+
+  appendStartedTurn(transcriptDir, transcriptName, "later post-rebaseline turn");
+  await waitForSignal(startProcessed.promise, "the later post-rebaseline start record");
+  assert.equal(replies.some((reply) => reply.includes("later post-rebaseline completion")), false);
+  appendCompletedResponse(transcriptDir, transcriptName, "later post-rebaseline completion");
+  await waitForSignal(posted.promise, "the later post-rebaseline completion");
+
+  assert.equal(replies.filter((reply) => reply.includes("later post-rebaseline completion")).length, 1);
+  assert.equal(replies.some((reply) => reply.includes("before EOF baseline")), false);
+});
+
+test("an Orca watcher preserves collected output across a transient transcript absence", { timeout: 10_000 }, async (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), "cctag-orca-watch-transient-missing-"));
+  const transcriptDir = transcriptDirFor(cwd);
+  const hiddenDir = transcriptDir + "-hidden";
+  const storeDir = mkdtempSync(join(tmpdir(), "cctag-orca-watch-store-"));
+  const transcriptName = "session-a.jsonl";
+  const secondGet = deferred();
+  const releaseSecondGet = deferred();
+  const thirdGet = deferred();
+  const releaseThirdGet = deferred();
+  const fourthGet = deferred();
+  const releaseFourthGet = deferred();
+  const fifthGet = deferred();
+  let getCount = 0;
+  let watcher: BackgroundWatcher | undefined;
+  t.after(() => {
+    releaseSecondGet.resolve();
+    releaseThirdGet.resolve();
+    releaseFourthGet.resolve();
+    watcher?.stop();
+    rmSync(transcriptDir, { recursive: true, force: true });
+    rmSync(hiddenDir, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(storeDir, { recursive: true, force: true });
+  });
+
+  writeStartedTurn(transcriptDir, transcriptName);
+  const agent = fakeOrcaHintAgent(cwd);
+  const store = storeWithPairing(storeDir, { ...orcaPairing(), cwd });
+  const posted = deferred();
+  const { notifier, replies } = fakeNotifier((text) => {
+    if (text.includes("orca transient output")) posted.resolve();
+  });
+  const terminals = fakeTerminals(async () => {
+    getCount += 1;
+    if (getCount === 2) {
+      secondGet.resolve();
+      await releaseSecondGet.promise;
+    }
+    if (getCount === 3) {
+      thirdGet.resolve();
+      await releaseThirdGet.promise;
+    }
+    if (getCount === 4) {
+      fourthGet.resolve();
+      await releaseFourthGet.promise;
+    }
+    if (getCount === 5) fifthGet.resolve();
+    return agent;
+  });
+  watcher = new BackgroundWatcher("orca", terminals, store, fakeOrcaTurnEngine(), notifier, 10);
+  watcher.start();
+
+  await waitForSignal(secondGet.promise, "the first post-baseline tick");
+  appendStartedTurn(transcriptDir, transcriptName, "orca transient output");
+  releaseSecondGet.resolve();
+  await waitForSignal(thirdGet.promise, "the collected-output tick");
+  assert.equal(replies.some((reply) => reply.includes("orca transient output")), false);
+
+  renameSync(transcriptDir, hiddenDir);
+  releaseThirdGet.resolve();
+  await waitForSignal(fourthGet.promise, "the tick after transient absence");
+  renameSync(hiddenDir, transcriptDir);
+  appendCompletedResponse(transcriptDir, transcriptName, "orca completion after transient absence");
+  releaseFourthGet.resolve();
+  await waitForSignal(posted.promise, "the post-absence Orca response");
+  await waitForSignal(fifthGet.promise, "the following Orca tick");
+
+  assert.equal(
+    replies.filter((reply) => reply.includes("orca transient output")).length,
+    1,
+    `the retained output should be posted exactly once, got ${JSON.stringify(replies)}`,
+  );
+  assert.equal(replies.some((reply) => reply.includes("before EOF baseline")), false);
+});
+
+
+test("an Orca watcher reports a whole turn completed between polls", { timeout: 10_000 }, async (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), "cctag-orca-watch-one-tick-"));
+  const transcriptDir = transcriptDirFor(cwd);
+  const storeDir = mkdtempSync(join(tmpdir(), "cctag-orca-watch-store-"));
+  const transcriptName = "session-a.jsonl";
+  let watcher: BackgroundWatcher | undefined;
+  const releaseSecondGet = deferred();
+  t.after(() => {
+    releaseSecondGet.resolve();
+    watcher?.stop();
+    rmSync(transcriptDir, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(storeDir, { recursive: true, force: true });
+  });
+  try {
+    writeCompletedTurn(transcriptDir, transcriptName, "old watcher history");
+    const agent: AgentInfo = {
+      ...fakeAgent("idle", cwd),
+      ref: { target: ORCA_PANE, pid: 42, processStartedAt: 1 },
+      backend: "orca",
+      sessionId: "session-a",
+      evidence: { kind: "hint", state: "done", waitingSince: null },
+    };
+    const pairing = { ...orcaPairing(), cwd };
+    const store = storeWithPairing(storeDir, pairing);
+    const posted = deferred();
+    const { notifier, replies } = fakeNotifier((text) => {
+      if (text.includes("one-tick output")) posted.resolve();
+    });
+    const secondGet = deferred();
+    const thirdGet = deferred();
+    let getCount = 0;
+    const terminals = fakeTerminals(async () => {
+      getCount += 1;
+      if (getCount === 2) {
+        secondGet.resolve();
+        await releaseSecondGet.promise;
+      }
+      if (getCount === 3) thirdGet.resolve();
+      return agent;
+    });
+    const turnEngine = {
+      ...idleEngine,
+      async uploadOutboxAdditions(...args: Parameters<TurnEngine["uploadOutboxAdditions"]>) {
+        return args[2];
+      },
+    } as unknown as TurnEngine;
+    watcher = new BackgroundWatcher("orca", terminals, store, turnEngine, notifier, 10);
+    watcher.start();
+
+    await secondGet.promise;
+    appendStartedTurn(transcriptDir, transcriptName, "one-tick output");
+    appendCompletedResponse(transcriptDir, transcriptName, "one-tick final output");
+    releaseSecondGet.resolve();
+    await posted.promise;
+    await thirdGet.promise;
+
+    assert.equal(replies.filter((reply) => reply.includes("one-tick output")).length, 1);
+    assert.equal(replies.some((reply) => reply.includes("old watcher history")), false);
+  } finally {
+    releaseSecondGet.resolve();
+    watcher?.stop();
+    rmSync(transcriptDir, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(storeDir, { recursive: true, force: true });
+  }
+});
+
+test("a herdr watcher reports a whole turn completed between polls", {
+  timeout: 10_000,
+  todo: "herdr one-tick gap, separate issue",
+}, async (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), "cctag-herdr-watch-one-tick-"));
+  const transcriptDir = transcriptDirFor(cwd);
+  const storeDir = mkdtempSync(join(tmpdir(), "cctag-herdr-watch-store-"));
+  const transcriptName = "session-a.jsonl";
+  const releaseSecondGet = deferred();
+  let watcher: BackgroundWatcher | undefined;
+  t.after(() => {
+    releaseSecondGet.resolve();
+    watcher?.stop();
+    rmSync(transcriptDir, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(storeDir, { recursive: true, force: true });
+  });
+  try {
+    writeCompletedTurn(transcriptDir, transcriptName, "old herdr history");
+    const agent = { ...fakeAgent("idle", cwd), sessionId: "session-a" };
+    const pairing = { ...fakePairing(), cwd };
+    const store = storeWithPairing(storeDir, pairing);
+    const posted = deferred();
+    const { notifier, replies } = fakeNotifier((text) => {
+      if (text.includes("herdr one-tick output")) posted.resolve();
+    });
+    const secondGet = deferred();
+    const thirdGet = deferred();
+    let getCount = 0;
+    const terminals = fakeTerminals(async () => {
+      getCount += 1;
+      if (getCount === 2) {
+        secondGet.resolve();
+        await releaseSecondGet.promise;
+      }
+      if (getCount === 3) thirdGet.resolve();
+      return agent;
+    });
+    const turnEngine = {
+      ...idleEngine,
+      async uploadOutboxAdditions(...args: Parameters<TurnEngine["uploadOutboxAdditions"]>) {
+        return args[2];
+      },
+    } as unknown as TurnEngine;
+    watcher = new BackgroundWatcher("herdr", terminals, store, turnEngine, notifier, 10);
+    watcher.start();
+
+    await secondGet.promise;
+    appendStartedTurn(transcriptDir, transcriptName, "herdr one-tick output");
+    appendCompletedResponse(transcriptDir, transcriptName, "herdr one-tick final output");
+    releaseSecondGet.resolve();
+    await thirdGet.promise;
+
+    assert.equal(
+      replies.filter((reply) => reply.includes("herdr one-tick output")).length,
+      1,
+      `the one-poll turn should report once, got ${JSON.stringify(replies)}`,
+    );
+    assert.equal(replies.some((reply) => reply.includes("old herdr history")), false);
+  } finally {
+    releaseSecondGet.resolve();
+    watcher?.stop();
+    rmSync(transcriptDir, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(storeDir, { recursive: true, force: true });
+  }
+});
+
+test("a Herdr watcher preserves collected output across a transient transcript absence", { timeout: 10_000 }, async (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), "cctag-herdr-watch-transient-missing-"));
+  const transcriptDir = transcriptDirFor(cwd);
+  const hiddenDir = transcriptDir + "-hidden";
+  const storeDir = mkdtempSync(join(tmpdir(), "cctag-herdr-watch-store-"));
+  const transcriptName = "session-a.jsonl";
+  const secondGet = deferred();
+  const releaseSecondGet = deferred();
+  const thirdGet = deferred();
+  const releaseThirdGet = deferred();
+  const fourthGet = deferred();
+  const releaseFourthGet = deferred();
+  const fifthGet = deferred();
+  let status: AgentStatus = "working";
+  let getCount = 0;
+  let watcher: BackgroundWatcher | undefined;
+  t.after(() => {
+    releaseSecondGet.resolve();
+    releaseThirdGet.resolve();
+    releaseFourthGet.resolve();
+    watcher?.stop();
+    rmSync(transcriptDir, { recursive: true, force: true });
+    rmSync(hiddenDir, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(storeDir, { recursive: true, force: true });
+  });
+
+  writeCompletedTurn(transcriptDir, transcriptName, "old herdr history");
+  const store = storeWithPairing(storeDir, { ...fakePairing(), cwd });
+  const turnEngine = {
+    ...idleEngine,
+    async uploadOutboxAdditions(...args: Parameters<TurnEngine["uploadOutboxAdditions"]>) {
+      return args[2];
+    },
+  } as unknown as TurnEngine;
+  const posted = deferred();
+  const { notifier, replies } = fakeNotifier((text) => {
+    if (text.includes("herdr transient output")) posted.resolve();
+  });
+  const terminals = fakeTerminals(async () => {
+    getCount += 1;
+    if (getCount === 2) {
+      secondGet.resolve();
+      await releaseSecondGet.promise;
+    }
+    if (getCount === 3) {
+      thirdGet.resolve();
+      await releaseThirdGet.promise;
+    }
+    if (getCount === 4) {
+      fourthGet.resolve();
+      await releaseFourthGet.promise;
+    }
+    if (getCount === 5) fifthGet.resolve();
+    return { ...fakeAgent(status, cwd), sessionId: "session-a" };
+  });
+  watcher = new BackgroundWatcher("herdr", terminals, store, turnEngine, notifier, 10);
+  watcher.start();
+
+  await waitForSignal(secondGet.promise, "the first post-baseline tick");
+  appendStartedTurn(transcriptDir, transcriptName, "herdr transient output");
+  releaseSecondGet.resolve();
+  await waitForSignal(thirdGet.promise, "the collected-output tick");
+  assert.equal(replies.some((reply) => reply.includes("herdr transient output")), false);
+
+  renameSync(transcriptDir, hiddenDir);
+  releaseThirdGet.resolve();
+  await waitForSignal(fourthGet.promise, "the tick after transient absence");
+  renameSync(hiddenDir, transcriptDir);
+  appendCompletedResponse(transcriptDir, transcriptName, "herdr completion after transient absence");
+  status = "idle";
+  releaseFourthGet.resolve();
+  await waitForSignal(posted.promise, "the post-absence Herdr response");
+  await waitForSignal(fifthGet.promise, "the following Herdr tick");
+
+  assert.equal(
+    replies.filter((reply) => reply.includes("herdr transient output")).length,
+    1,
+    `the retained output should be posted exactly once, got ${JSON.stringify(replies)}`,
+  );
+  assert.equal(replies.some((reply) => reply.includes("old herdr history")), false);
+});
+
 
 test("a working pane with no turn boundary in its transcript is left running", async () => {
   // The other direction, and the one that must not regress: assistant text with

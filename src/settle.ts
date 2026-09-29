@@ -40,16 +40,12 @@ export class SettleTracker {
    */
   private phase: "unknown" | "running" | "finished" = "unknown";
 
-  /**
-   * Declares a turn already in progress, for a pane adopted mid-turn.
+  /** Declares a turn already in progress when its start predates this offset.
    *
-   * Needed only there. A Slack-initiated turn gets a fresh tracker and its own
-   * `user` record supplies the start, but adopting a blocked terminal joins a
-   * turn whose start was written before the handoff's offset — so waiting for
-   * one would mean the completion that eventually arrives is ignored, and an
-   * adopted turn on a stuck-`working` pane would never finalize. Safe here
-   * because the prompt on screen is itself proof the turn is live, and the
-   * handoff's offset rules out reading a completion from an earlier turn.
+   * Used when adopting a blocked terminal, whose screen proves the turn is live,
+   * and when BackgroundWatcher baselines a transcript whose latest boundary is
+   * `started`. Slack-initiated turns do not call this: their own `user` record
+   * must arm a fresh tracker before a completion can settle it.
    */
   markTurnRunning(): void {
     this.phase = "running";
@@ -157,6 +153,8 @@ export async function resolveStatus(input: {
     return { status: "blocked", extendDeadline: true };
   }
 
+  if (input.settle.settledByTranscript) return { status: "idle", extendDeadline: false };
+
   if (input.boundaries.lastBoundary === "started") {
     let screen: StatusScreenEvidence | null;
     try {
@@ -176,7 +174,13 @@ export async function resolveStatus(input: {
     };
   }
 
-  if (input.boundaries.lastBoundary === "ended") return { status: "idle", extendDeadline: false };
+  if (input.boundaries.lastBoundary === "ended") {
+    // A bounded suffix may contain a completion from before this turn/watch's
+    // offset. Only lifecycle events observed by the tracker may settle it.
+    const status =
+      input.previousStatus === "blocked" || input.previousStatus === "working" ? input.previousStatus : "unknown";
+    return { status, extendDeadline: false };
+  }
   if (state === "working") return { status: "working", extendDeadline: false };
   if (state === "done") return { status: "idle", extendDeadline: false };
   return { status: "unknown", extendDeadline: false };
