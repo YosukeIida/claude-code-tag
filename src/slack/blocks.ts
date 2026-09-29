@@ -13,6 +13,12 @@ const STATUS_ICON: Record<string, string> = {
   unknown: "⚪",
 };
 
+const ORCA_AGENT_NAME: Record<AgentInfo["agent"], string> = {
+  claude: "Claude Code",
+  codex: "Codex CLI",
+  omp: "oh-my-pi",
+};
+
 function truncateLeft(s: string, max: number): string {
   if (s.length <= max) return s;
   return "…" + s.slice(s.length - max + 1);
@@ -23,12 +29,38 @@ function dirLabel(cwd: string): string {
   return base && base.length > 0 ? base : cwd;
 }
 
+function pickerLabel(agent: AgentInfo): string {
+  if (agent.terminalTitle !== null) return agent.terminalTitle;
+  if (agent.backend !== "orca") return agent.displayId;
+
+  const paneId = agent.ref.target.slice(agent.ref.target.lastIndexOf(":") + 1);
+  return `${ORCA_AGENT_NAME[agent.agent]} · ${paneId.slice(0, 8)}`;
+}
+
+function pickerStatusIcon(agent: AgentInfo): string {
+  if (agent.backend !== "orca") {
+    return STATUS_ICON[classifiedStatus(agent.evidence)] ?? "⚪";
+  }
+  switch (agent.pickerState) {
+    case "working":
+      return "🟡";
+    case "waiting":
+    case "blocked":
+      return "🔴";
+    case "done":
+    case "idle":
+      return "🟢";
+    default:
+      return "⚪";
+  }
+}
+
 /**
  * A static_select of currently running backend agents, for `@cctag connect`.
  *
  * Grouped by backend and project directory via Slack's native `option_groups`,
- * with each row showing the terminal title when available and a backend-provided
- * display ID otherwise.
+ * with terminal titles when available. Title-less Orca rows use the agent name
+ * and a short pane ID; Herdr rows keep their backend-provided display ID.
  */
 export function agentPickerBlocks(result: ListResult, enabledBackends: readonly BackendName[]) {
   const agents = result.agents;
@@ -53,11 +85,10 @@ export function agentPickerBlocks(result: ListResult, enabledBackends: readonly 
   const groups = new Map<string, { label: string; cwd: string; agents: AgentInfo[] }>();
   for (const agent of agents) {
     const backend = backendForTarget(agent.ref.target);
-    const label = agent.agent === "omp" ? "omp" : backend;
-    const key = `${backend}\0${label}\0${agent.cwd}`;
+    const key = `${backend}\0${agent.cwd}`;
     const group = groups.get(key);
     if (group) group.agents.push(agent);
-    else groups.set(key, { label, cwd: agent.cwd, agents: [agent] });
+    else groups.set(key, { label: backend, cwd: agent.cwd, agents: [agent] });
   }
 
   return [
@@ -72,11 +103,11 @@ export function agentPickerBlocks(result: ListResult, enabledBackends: readonly 
           label: { type: "plain_text", text: `${groupLabel} · ${dirLabel(cwd)}`.slice(0, 75) },
           options: group.map((agent) => {
             const prefix = agent.agent !== "claude" ? `[${agent.agent}] ` : "";
-            const label = agent.terminalTitle ?? agent.displayId;
+            const label = pickerLabel(agent);
             return {
               text: {
                 type: "plain_text",
-                text: `${STATUS_ICON[classifiedStatus(agent.evidence)] ?? "⚪"} ${prefix}${label}`.slice(0, 75),
+                text: `${pickerStatusIcon(agent)} ${prefix}${label}`.slice(0, 75),
               },
               value: agent.ref.target,
             };

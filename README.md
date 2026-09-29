@@ -37,9 +37,9 @@ Codex CLI on Herdr; see the support matrix for Orca combinations.
 
 cctag can also drive agents running in [Orca](https://github.com/stablyai/orca)
 terminals, alongside herdr, from the same Spoke. In the `@cctag connect` picker,
-Orca Claude Code rows appear under `orca · <directory name>`, while `omp` rows
-appear under `omp · <directory name>` and carry the `[omp]` prefix. Herdr pane
-IDs and existing pairings keep their current format.
+Orca Claude Code and `omp` rows share the `orca · <directory name>` group;
+`omp` rows carry the `[omp]` prefix. Herdr pane IDs and existing pairings keep
+their current format.
 See [Terminal backends](#terminal-backends-herdr-and-orca).
 
 ## What this actually looks like in use

@@ -142,7 +142,7 @@ test("anything that is not the multi-select submit passes through untouched", ()
   assert.equal(withSelectedIndices("not json at all", {}), "not json at all");
 });
 
-test("the agent picker groups by backend and cwd, with a distinct OMP group", () => {
+test("the agent picker groups by backend and cwd with readable title-less Orca labels", () => {
   const agent = (
     target: string,
     backend: BackendName,
@@ -151,6 +151,7 @@ test("the agent picker groups by backend and cwd, with a distinct OMP group", ()
     status: AgentStatus,
     terminalTitle: string | null,
     displayId: string,
+    pickerState: string | null = null,
   ): AgentInfo => ({
     ref: { target, pid: null, processStartedAt: null },
     backend,
@@ -161,13 +162,15 @@ test("the agent picker groups by backend and cwd, with a distinct OMP group", ()
     terminalTitle,
     terminalId: "herdr-terminal-id",
     displayId,
+    pickerState,
   });
-  const orcaTarget = `orca:${"x".repeat(73)}`;
+  const paneKey = "e89f6036-1062-4bbf-9a11-86aab4cc3f47";
+  const orcaTarget = `orca:${paneKey}`;
   const result: ListResult = {
     agents: [
       agent("wT:p1", "herdr", "/work/project", "claude", "idle", "Claude session", "pane-1"),
       agent("wT:p2", "herdr", "/work/project", "codex", "working", null, "pane-2"),
-      agent(orcaTarget, "orca", "/work/project", "codex", "blocked", "Remote session", "orca:42"),
+      agent(orcaTarget, "orca", "/work/project", "claude", "working", null, orcaTarget, "waiting"),
       agent("orca:omp-pane", "orca", "/work/project", "omp", "working", "OMP session", "omp-pane"),
     ],
     failures: [],
@@ -182,18 +185,59 @@ test("the agent picker groups by backend and cwd, with a distinct OMP group", ()
       }>;
     };
   }>;
-  const groups = blocks[0].accessory.option_groups;
-  assert.deepEqual(groups.map((group) => group.label.text), ["herdr · project", "orca · project", "omp · project"]);
+  const groups = blocks[0]!.accessory.option_groups;
+  assert.deepEqual(groups.map((group) => group.label.text), ["herdr · project", "orca · project"]);
   assert.deepEqual(groups[0]!.options.map((option) => option.value), ["wT:p1", "wT:p2"]);
   assert.deepEqual(groups[0]!.options.map((option) => option.text.text), [
     "🟢 Claude session",
     "🟡 [codex] pane-2",
   ]);
-  assert.equal(groups[1]!.options[0]!.value, orcaTarget);
-  assert.equal(groups[1]!.options[0]!.value.length, 78);
-  assert.ok(groups[1]!.options[0]!.value.length <= 150, "the Orca target must fit Slack's option value limit");
-  assert.equal(groups[1]!.options[0]!.text.text, "🔴 [codex] Remote session");
-  assert.equal(groups[2]!.options[0]!.text.text, "🟡 [omp] OMP session");
+  assert.deepEqual(groups[1]!.options.map((option) => option.value), [orcaTarget, "orca:omp-pane"]);
+  assert.deepEqual(groups[1]!.options.map((option) => option.text.text), [
+    "🔴 Claude Code · e89f6036",
+    "⚪ [omp] OMP session",
+  ]);
+});
+
+test("Orca picker icons use only recognized worktree states", () => {
+  const states = [
+    ["working", "🟡"],
+    ["waiting", "🔴"],
+    ["blocked", "🔴"],
+    ["done", "🟢"],
+    ["idle", "🟢"],
+    ["unrecognized", "⚪"],
+    [null, "⚪"],
+  ] as const;
+  const result: ListResult = {
+    agents: states.map(([pickerState], index) => ({
+      ref: { target: `orca:pane-${index}`, pid: null, processStartedAt: null },
+      backend: "orca",
+      agent: "claude",
+      sessionId: null,
+      cwd: "/work/project",
+      evidence: { kind: "classified", status: "blocked" },
+      terminalTitle: `Agent ${index}`,
+      terminalId: "",
+      displayId: `pane-${index}`,
+      pickerState,
+    })),
+    failures: [],
+    complete: true,
+    notices: [],
+  };
+  const blocks = agentPickerBlocks(result, ["orca"]) as unknown as Array<{
+    accessory: {
+      option_groups: Array<{
+        options: Array<{ text: { text: string }; value: string }>;
+      }>;
+    };
+  }>;
+  const options = blocks[0]!.accessory.option_groups[0]!.options;
+  assert.deepEqual(
+    options.map((option) => option.text.text.split(" ")[0]),
+    states.map(([, icon]) => icon),
+  );
 });
 
 test("an incomplete empty agent list explains backend failures and notices", () => {

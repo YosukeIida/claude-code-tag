@@ -318,6 +318,7 @@ function agentInfo(
   process: AgentProcessRow,
   session: OrcaProcessSession,
   evidence: AgentInfo["evidence"],
+  pickerState: string | null,
 ): AgentInfo {
   const target = `orca:${paneKey}`;
   const handle = stringField(terminal, "handle") ?? "";
@@ -338,6 +339,7 @@ function agentInfo(
     ...(session.transcriptIdentity ? { transcriptIdentity: session.transcriptIdentity } : {}),
     cwd: process.cwd ?? "",
     evidence,
+    pickerState,
     terminalTitle: title,
     terminalId: handle,
     displayId: title ?? target,
@@ -645,7 +647,17 @@ export class OrcaBackend implements Terminals {
         );
         continue;
       }
-      agents.push(agentInfo(paneKey, terminal, process, session, statusEvidence(worktreeAgentForPane(worktree, paneKey))));
+      const worktreeAgent = worktreeAgentForPane(worktree, paneKey);
+      agents.push(
+        agentInfo(
+          paneKey,
+          terminal,
+          process,
+          session,
+          statusEvidence(worktreeAgent),
+          worktreeAgent ? stringField(worktreeAgent, "state") : null,
+        ),
+      );
     }
 
     return {
@@ -678,12 +690,14 @@ export class OrcaBackend implements Terminals {
     } catch {
       return null;
     }
+    const worktreeAgent = worktreeAgentForPane(worktree, paneKey);
     return agentInfo(
       paneKey,
       { ...terminal, ...shown },
       process,
       session,
-      statusEvidence(worktreeAgentForPane(worktree, paneKey), shown),
+      statusEvidence(worktreeAgent, shown),
+      worktreeAgent ? stringField(worktreeAgent, "state") : null,
     );
   }
 

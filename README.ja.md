@@ -36,9 +36,9 @@ cctagは対応ドライバを選ぶ。HerdrではClaude CodeとCodex CLIを利�
 [ターミナルバックエンド](#ターミナルバックエンド-herdrとorca)の表を参照。
 
 cctagはherdrに加えて[Orca](https://github.com/stablyai/orca)のターミナルで動くエージェントも、
-同じSpokeから操作できる。`@cctag connect`では、Orca上のClaude Codeは
-`orca · <ディレクトリ名>`、`omp`は`omp · <ディレクトリ名>`のグループに表示され、
-`omp`の行には`[omp]`が付く。herdrのpane IDと既存のペアリング形式は変わらない。
+同じSpokeから操作できる。`@cctag connect`では、Orca上のClaude Codeと`omp`は
+同じ`orca · <ディレクトリ名>`グループに表示され、`omp`の行には`[omp]`が付く。
+herdrのpane IDと既存のペアリング形式は変わらない。
 詳細は[ターミナルバックエンド](#ターミナルバックエンド-herdrとorca)を参照。
 
 ## 実際の使われ方

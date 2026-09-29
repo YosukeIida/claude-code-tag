@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { agentPickerBlocks } from "../slack/blocks.js";
 import { claudeDriver } from "../agents/claude/driver.js";
 import { OMP_RESUME_NOTICE, ompDriver } from "../agents/omp/driver.js";
 import type { SubmitContext } from "./index.js";
@@ -589,6 +590,17 @@ test("discovers the Claude process and joins terminal, worktree state, cwd, and 
     state: "waiting",
     waitingSince: worktreeQuestionAgent.stateStartedAt,
   });
+  assert.equal(agent.pickerState, worktreeQuestionAgent.state);
+  const picker = agentPickerBlocks(result, ["orca"]) as unknown as Array<{
+    accessory: {
+      option_groups: Array<{
+        options: Array<{ text: { text: string }; value: string }>;
+      }>;
+    };
+  }>;
+  const option = picker[0]!.accessory.option_groups[0]!.options[0]!;
+  assert.match(option.text.text, /^🔴 /u);
+  assert.equal(option.value, TARGET);
   assert.equal(agent.terminalId, HANDLE);
   assert.deepEqual(runtime.readPaths, [SESSION_PATH(capture.process.pid)]);
   assert.ok(runtime.calls.every((call) => call.timeoutMs === 5_000));

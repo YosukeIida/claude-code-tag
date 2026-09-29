@@ -39,6 +39,8 @@ export interface AgentInfo {
   transcriptIdentity?: TranscriptIdentity;
   cwd: string;
   evidence: StatusEvidence;
+  /** Raw Orca worktree state for picker icons only; not status evidence. */
+  pickerState?: string | null;
   terminalTitle: string | null;
   /** Display/debug snapshot from the backend; may go stale and never addresses a terminal. */
   terminalId: string;
