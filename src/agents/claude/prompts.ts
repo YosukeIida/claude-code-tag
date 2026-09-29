@@ -562,10 +562,9 @@ export function parseCursorLabel(paneText: string): string | null {
   const lines = paneText.split("\n");
   let selectedNum: string | null = null;
   let selectedLabel = "";
-  // Unnumbered rows such as multi-select Submit are not parsed until a live
-  // capture establishes their selected-row rendering.
   for (let i = lines.length - 1; i >= 0; i--) {
-    const match = /^\s*❯\s*(\d+)\.\s*(.*?)\s*$/.exec(lines[i]);
+    if (/^\s*❯\s+Submit\s*$/.test(lines[i]!)) return "Submit";
+    const match = /^\s*❯\s*(\d+)\.\s*(.*?)\s*$/.exec(lines[i]!);
     if (match) {
       selectedNum = match[1];
       selectedLabel = match[2].trim();

@@ -1,8 +1,15 @@
+import { basename, join } from "node:path";
+
 import { promptFingerprint } from "../fingerprint.js";
 import type { AgentDriver, AskUserQuestionPaneInfo, BlockedPrompt } from "../driver.js";
-import type { Terminals } from "../../backend/index.js";
+import type { AnswerChannel, Terminals } from "../../backend/index.js";
 import { createBlindPermissionPrompt, createVerifiedPrompt } from "../../backend/prompt.js";
-import { ExpectationLost, type AgentInfo } from "../../backend/types.js";
+import {
+  ExpectationLost,
+  hasUnsendableC0Controls,
+  UNSENDABLE_TEXT_MESSAGE,
+} from "../../backend/types.js";
+import type { AgentInfo, AgentRef, ScreenSnapshot } from "../../backend/types.js";
 import {
   findPlanFeedbackOption,
   MODE_ALIASES,
@@ -31,6 +38,7 @@ import {
 } from "./transcript.js";
 import { resolvePlanFile } from "./plan.js";
 
+import { backendForTarget } from "../../backend/target.js";
 /** Same question, by everything visible about it — see answerQuestionOption. */
 function sameQuestion(
   a: { question: string; options: { label: string }[] },
@@ -49,6 +57,179 @@ function sleep(ms: number): Promise<void> {
 function assertAnswerNotAborted(signal?: AbortSignal): void {
   if (signal?.aborted) {
     throw new ExpectationLost("the compound answer was interrupted before completion");
+  }
+}
+const ANSWER_REVIEW_FAILURE =
+  "確認画面を確かめられなかったので送信していません。端末で確かめてください";
+
+function normalizedReviewText(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function answerListsMatch(
+  visible: readonly string[],
+  expected: readonly string[],
+): boolean {
+  const normalizedVisible = visible.map(normalizedReviewText);
+  const normalizedExpected = expected.map(normalizedReviewText);
+  if (normalizedExpected.some((answer) => answer.includes(","))) {
+    return normalizedVisible.join(", ") === normalizedExpected.join(", ");
+  }
+
+  const visibleLabels = normalizedVisible.flatMap((answer) =>
+    answer.split(/,\s*/u).map(normalizedReviewText),
+  );
+  const sortedVisible = visibleLabels.sort();
+  const sortedExpected = normalizedExpected.sort();
+  return (
+    sortedVisible.length === sortedExpected.length &&
+    sortedVisible.every((answer, index) => answer === sortedExpected[index])
+  );
+}
+
+function composerFooterStart(rows: readonly string[]): number | null {
+  for (let i = 1; i < rows.length - 1; i++) {
+    if (rows[i]!.trim() !== "❯") continue;
+    if (!/^[─━]+$/u.test(rows[i - 1]!.trim()) || !/^[─━]+$/u.test(rows[i + 1]!.trim())) continue;
+    if (rows.slice(i + 2).some((row) => row.trim())) return i - 1;
+  }
+  return null;
+}
+
+function isComposerFooterSuffix(rows: readonly string[]): boolean {
+  const start = composerFooterStart(rows);
+  return start !== null && rows.slice(0, start).every((row) => !row.trim());
+}
+
+function hasPromptInReviewSuffix(text: string): boolean {
+  return (
+    parseAskUserQuestionPane(text) !== null ||
+    parsePreviewQuestionPane(text) !== null ||
+    parsePermissionMenu(text) !== null ||
+    parseClaudeStartupPrompt(text) !== null ||
+    looksLikeQuestionScreen(text)
+  );
+}
+
+function answerReviewFingerprint(
+  snap: ScreenSnapshot,
+  expected?: { question: string; answers: readonly string[]; deadlineAt?: number },
+): string | null {
+  if (!snap.complete) return null;
+  const rows = snap.text.split(/\r?\n/);
+  const headingAt = rows.lastIndexOf("Ready to submit your answers?");
+  const reviewAt = rows.lastIndexOf("Review your answers", headingAt);
+  if (reviewAt < 0 || headingAt < 0) return null;
+  const submitRow = rows[headingAt + 1];
+  const cancelRow = rows[headingAt + 2];
+  if (
+    !submitRow ||
+    !/^\s*❯\s*1\.\s*Submit answers\s*$/.test(submitRow) ||
+    !cancelRow ||
+    !/^\s*2\.\s*Cancel\s*$/.test(cancelRow) ||
+    parseClaudeCursorLabel(snap.text) !== "Submit answers"
+  ) {
+    return null;
+  }
+
+  const suffixRows = rows.slice(headingAt + 3);
+  const suffix = suffixRows.join("\n");
+  if (
+    suffixRows.some((row) => row.trim()) &&
+    (!isComposerFooterSuffix(suffixRows) || hasPromptInReviewSuffix(suffix))
+  ) {
+    return null;
+  }
+
+  const contentRows = rows.slice(reviewAt + 1, headingAt);
+  const answersByQuestion = new Map<string, string[]>();
+  let question: string | null = null;
+  for (const row of contentRows) {
+    if (!row.trim()) continue;
+    const questionRow = /^\s*●\s*(.*?)\s*$/.exec(row);
+    if (questionRow) {
+      question = normalizedReviewText(questionRow[1]!);
+      if (!question) return null;
+      answersByQuestion.set(question, []);
+      continue;
+    }
+    const answerRow = /^\s*→\s*(.*?)\s*$/.exec(row);
+    if (answerRow && question !== null) {
+      const visibleAnswer = normalizedReviewText(answerRow[1]!);
+      if (!visibleAnswer) return null;
+      answersByQuestion.get(question)!.push(visibleAnswer);
+      continue;
+    }
+    return null;
+  }
+
+  if (expected) {
+    const visibleAnswers = answersByQuestion.get(normalizedReviewText(expected.question));
+    if (!visibleAnswers || !answerListsMatch(visibleAnswers, expected.answers)) return null;
+  }
+
+  return promptFingerprint({
+    kind: "question",
+    info: {
+      header: "Review your answers",
+      question: "Ready to submit your answers?",
+      multiSelect: false,
+      options: [
+        { label: "Submit answers", description: contentRows.join("\n") },
+        { label: "Cancel" },
+      ],
+    },
+  });
+}
+
+async function confirmOrcaAnswerReview(
+  terminals: Terminals,
+  channel: AnswerChannel,
+  ref: AgentRef,
+  info: AskUserQuestionPaneInfo,
+  answers: readonly string[],
+  signal?: AbortSignal,
+): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (true) {
+    assertAnswerNotAborted(signal);
+    if (Date.now() >= deadline) {
+      throw new ExpectationLost(ANSWER_REVIEW_FAILURE, ANSWER_REVIEW_FAILURE);
+    }
+    let snap: ScreenSnapshot;
+    try {
+      snap = await terminals.read(ref.target, 60, "screen");
+    } catch {
+      assertAnswerNotAborted(signal);
+      throw new ExpectationLost(ANSWER_REVIEW_FAILURE, ANSWER_REVIEW_FAILURE);
+    }
+    assertAnswerNotAborted(signal);
+    if (Date.now() >= deadline) {
+      throw new ExpectationLost(ANSWER_REVIEW_FAILURE, ANSWER_REVIEW_FAILURE);
+    }
+    const review = claudeDriver.parseAnswerReview?.(snap, {
+      question: info.question,
+      answers,
+      deadlineAt: deadline,
+    });
+    if (review) {
+      assertAnswerNotAborted(signal);
+      if (Date.now() >= deadline) {
+        throw new ExpectationLost(ANSWER_REVIEW_FAILURE, ANSWER_REVIEW_FAILURE);
+      }
+      const reviewChannel = terminals.openAnswer(ref, review);
+      assertAnswerNotAborted(signal);
+      if (Date.now() >= deadline) {
+        throw new ExpectationLost(ANSWER_REVIEW_FAILURE, ANSWER_REVIEW_FAILURE);
+      }
+      await reviewChannel.digit(1, true);
+      channel.complete();
+      return;
+    }
+    if (Date.now() >= deadline) {
+      throw new ExpectationLost(ANSWER_REVIEW_FAILURE, ANSWER_REVIEW_FAILURE);
+    }
+    await sleep(100);
   }
 }
 
@@ -113,6 +294,28 @@ async function runClaudeSlashCommand(
 
 export const claudeDriver: AgentDriver = {
   kind: "claude",
+  orcaProcess: {
+    listable: true,
+    hooks: {
+      agent: "claude",
+      missingNotice: "Orca Claude hooks are not installed; state hints may be incomplete.",
+      unavailableNotice: "Unable to confirm Orca Claude hook installation; state hints may be incomplete.",
+    },
+    matchesCommand(command) {
+      const [executable, ...args] = command.trim().split(/\s+/);
+      const name = basename(executable ?? "");
+      return name === "claude" || (name === "node" && args.some((arg) => arg.includes("@anthropic-ai/claude-code")));
+    },
+    async sessionId(pid, access) {
+      const path = join(access.homeDir, ".claude", "sessions", `${pid}.json`);
+      const session = JSON.parse(await access.readFile(path)) as { sessionId?: unknown };
+      if (typeof session.sessionId !== "string" || session.sessionId.length === 0) {
+        throw new Error("Claude session id is missing");
+      }
+      return session.sessionId;
+    },
+  },
+
   displayName: "Claude Code",
   readRegion: "history",
 
@@ -129,6 +332,9 @@ export const claudeDriver: AgentDriver = {
       sendFileRequests: extractSendUserFileRequests(r),
       toolOutcomes: extractToolOutcomes(r),
     };
+  },
+  extractLifecycle(records) {
+    return extractLifecycle(records as TranscriptRecord[]);
   },
 
   parseStartupPrompt: parseClaudeStartupPrompt,
@@ -195,8 +401,26 @@ export const claudeDriver: AgentDriver = {
       ),
     };
   },
+  parseAnswerReview(snap, expected) {
+    const fingerprint = answerReviewFingerprint(snap, expected);
+    return fingerprint === null
+      ? null
+      : createVerifiedPrompt(fingerprint, claudeDriver, "digit-confirms", {
+          expectedCursorLabel: "Submit answers",
+          ...(expected?.deadlineAt === undefined
+            ? {}
+            : { expiresAt: expected.deadlineAt, expiredUserMessage: ANSWER_REVIEW_FAILURE }),
+        });
+  },
   parseCursorLabel(snap) {
     return snap.complete ? parseClaudeCursorLabel(snap.text) : null;
+  },
+  isIdleComposer(snap) {
+    if (!snap.complete) return false;
+    const rows = snap.text.split(/\r?\n/);
+    if (rows.some((row) => /^✳\s+\S/u.test(row.trimStart()))) return false;
+
+    return composerFooterStart(rows) !== null;
   },
 
   async answerOption(channel, value, _expectedLabel) {
@@ -268,11 +492,17 @@ export const claudeDriver: AgentDriver = {
     //
     // — but only when this was the *last* question of the dialog. For an earlier
     // one the next question comes up instead, and a `1` sent there would toggle
-    // that question's first option. So the pane is the witness, exactly as in
-    // answerQuestionOption; anything other than the review screen is left alone
-    // for the poll loop to post.
+    // that question's first option. The pane is the witness before sending `1`.
+    // Orca requires the complete review; Herdr keeps its existing non-review
+    // transition behavior and leaves that next question for the poll loop.
     await sleep(500);
     assertAnswerNotAborted(signal);
+    if (backendForTarget(ref.target) === "orca") {
+      const selected = new Set(optionNums);
+      const answers = info.options.flatMap((option, index) => (selected.has(index + 1) ? [option.label] : []));
+      await confirmOrcaAnswerReview(terminals, channel, ref, info, answers, signal);
+      return;
+    }
     const after = (await terminals.read(ref.target, 60, "history")).text;
     assertAnswerNotAborted(signal);
     if (!SUBMIT_ANSWERS_RE.test(after)) {
@@ -282,14 +512,21 @@ export const claudeDriver: AgentDriver = {
     await channel.digit(1, true);
   },
 
-  async answerQuestionFreeText(terminals, channel, ref, info, text) {
+  async answerQuestionFreeText(terminals, channel, ref, info, text, signal) {
     // Navigate down to the "Type something" row (the free-text row must be
     // reached via arrows and then have its placeholder replaced before Enter).
+    const isOrca = backendForTarget(ref.target) === "orca";
+    if (isOrca && hasUnsendableC0Controls(text)) {
+      throw new ExpectationLost(UNSENDABLE_TEXT_MESSAGE, UNSENDABLE_TEXT_MESSAGE);
+    }
+    if (isOrca) assertAnswerNotAborted(signal);
     if (info.options.length > 0) await channel.move("Down", info.options.length);
+    if (isOrca) assertAnswerNotAborted(signal);
     await channel.text(text);
     await sleep(200);
 
     if (!info.multiSelect) {
+      if (isOrca) assertAnswerNotAborted(signal);
       await channel.confirm(text);
       return;
     }
@@ -304,8 +541,14 @@ export const claudeDriver: AgentDriver = {
     // unsubmitted — reported from production as "replying 1,3 didn't work".
     // Submitting is the same walk as answerQuestionMultiSelect's: one more Down
     // onto Submit, Enter, then confirm the review screen.
+    if (isOrca) assertAnswerNotAborted(signal);
     await channel.move("Down", 1);
+    if (isOrca) assertAnswerNotAborted(signal);
     await channel.confirm("Submit", false);
+    if (isOrca) {
+      await confirmOrcaAnswerReview(terminals, channel, ref, info, [text], signal);
+      return;
+    }
     await sleep(500);
     const after = (await terminals.read(ref.target, 60, "history")).text;
     if (!SUBMIT_ANSWERS_RE.test(after)) {

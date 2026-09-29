@@ -1,0 +1,92 @@
+{
+  "captureDate": "2026-09-28",
+  "claudeVersion": "2.1.283",
+  "orcaCliVersion": "1.4.215",
+  "orcaAppVersion": "1.4.215",
+  "state": "ask-user-question-waiting",
+  "sourceCommands": {
+    "worktreePs": "orca worktree ps --json",
+    "terminalList": "orca terminal list --worktree path:<worktree-B> --json",
+    "process": "ps -p <pid> -o pid=,ppid=,pgid=,tpgid=,tty=,lstart=,command=",
+    "environment": "ps eww -p <pid>; retained only ORCA_PANE_KEY and ORCA_TERMINAL_HANDLE"
+  },
+  "redactions": {
+    "<plan>": "account-tier plan label",
+    "<scratch>": "task-specific scratch directory and status-line label",
+    "<task-worktree>": "task-specific workspace path and branch",
+    "<redacted>": "private usage percentages and reset-time values",
+    "<terminal-A>": "first orphaned terminal handle",
+    "<terminal-B>": "registered-worktree terminal handle",
+    "<pty-A>": "first terminal PTY identifier",
+    "<pty-B>": "registered-worktree terminal PTY identifier",
+    "<incarnation-A>": "first terminal process incarnation identifier",
+    "<incarnation-B>": "registered-worktree process incarnation identifier",
+    "<pane-A>": "first terminal process pane key",
+    "<orphaned-pane-A>": "first orphaned terminal tab and leaf identifiers",
+    "<tab-B>": "registered-worktree terminal tab identifier",
+    "<leaf-B>": "registered-worktree terminal leaf identifier",
+    "<tab-B>:<leaf-B>": "registered-worktree composite pane key shared by the process and worktree row",
+    "<worktree-A>": "task worktree identifier",
+    "<worktree-B>": "registered main worktree identifier and path",
+    "<session-A>": "first Claude session identifier",
+    "<session-B>": "second Claude session identifier",
+    "<bridge-session-A>": "Claude bridge session identifier",
+    "<terminal-title>": "task-specific terminal title"
+  },
+  "worktreePs": {
+    "agents": [
+      {
+        "paneKey": "<tab-B>:<leaf-B>",
+        "parentPaneKey": null,
+        "state": "waiting",
+        "agentType": "claude",
+        "prompt": "Use the AskUserQuestion tool to ask me a single-select question titled Test color, with three options: amber, cobalt, and jade, each with a one-line description. Do not use any other tools.",
+        "taskTitle": null,
+        "displayName": null,
+        "lastAssistantMessage": null,
+        "toolName": "AskUserQuestion",
+        "toolInput": null,
+        "interrupted": false,
+        "stateStartedAt": 1790597626912,
+        "updatedAt": 1790597626958
+      }
+    ]
+  },
+  "terminalList": {
+    "totalCount": 1,
+    "truncated": false,
+    "terminals": [
+      {
+        "handle": "<terminal-B>",
+        "ptyId": "<pty-B>",
+        "incarnationId": "<incarnation-B>",
+        "orphaned": false,
+        "worktreeId": "<worktree-B>",
+        "worktreePath": "<worktree-B>",
+        "branch": "refs/heads/main",
+        "tabId": "<tab-B>",
+        "leafId": "<leaf-B>",
+        "title": "<terminal-title>",
+        "connected": true,
+        "writable": true,
+        "lastOutputAt": 1790597715731,
+        "preview": "Enter to select · ↑/↓ to navigate · Esc to cancel                                             B",
+        "executionHostId": "local",
+        "agentIdentity": "claude"
+      }
+    ]
+  },
+  "process": {
+    "pid": 32521,
+    "ppid": 32467,
+    "pgid": 32521,
+    "tpgid": 32521,
+    "tty": "ttys019",
+    "lstart": "Mon Sep 28 20:28:02 2026",
+    "command": "claude",
+    "environment": {
+      "ORCA_PANE_KEY": "<tab-B>:<leaf-B>",
+      "ORCA_TERMINAL_HANDLE": "<terminal-B>"
+    }
+  }
+}

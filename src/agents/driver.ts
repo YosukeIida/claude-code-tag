@@ -117,9 +117,34 @@ export interface ModeSupport {
  * that changes which CLI is running in it picks up the right driver on the
  * very next interaction.
  */
+export interface OrcaProcessAccess {
+  homeDir: string;
+  readFile(path: string): Promise<string>;
+}
+
+/** OS-process identity hooks used only by the Orca backend. */
+export interface OrcaProcessDriver {
+  /** Whether processes for this driver may be listed by Orca. */
+  readonly listable: boolean;
+  /** Hook-status mapping and notices owned by this agent's driver. */
+  readonly hooks?: {
+    readonly agent: string;
+    readonly missingNotice: string;
+    readonly unavailableNotice: string;
+  };
+  /** Notice included when a recognized driver is not supported by Orca. */
+  readonly unsupportedNotice?: string;
+  matchesCommand(command: string): boolean;
+  /** Missing session identity makes the process ineligible for listing. */
+  sessionId?(pid: number, access: OrcaProcessAccess): Promise<string>;
+}
+
 export interface AgentDriver {
   readonly kind: string;
   readonly displayName: string;
+  /** Optional process identity support for Orca; Herdr reports its own kind. */
+  readonly orcaProcess?: OrcaProcessDriver;
+
 
   /**
    * Which `Terminals.read` region captures this agent's TUI. Herdr maps
@@ -135,11 +160,19 @@ export interface AgentDriver {
   locateTranscript(cwd: string, sessionId: string | null): string | null;
   /** Assistant text + tool-call names from freshly-tailed transcript records. */
   extractTurnOutput(records: unknown[]): TurnOutput;
+  /** Turn boundaries from transcript records, without extracting their output. */
+  extractLifecycle(records: unknown[]): TurnLifecycleEvent[];
 
   /** Classifies what a `blocked` pane is currently showing. */
   parseBlockedPane(paneText: string): BlockedPrompt;
-  /** Label on the currently selected menu row, or null when it cannot be read. */
+  /** Parses a complete post-submit review and, when supplied, verifies this answer's visible selection. */
+  parseAnswerReview?(
+    snap: ScreenSnapshot,
+    expected?: { question: string; answers: readonly string[]; deadlineAt?: number },
+  ): VerifiedPrompt | null;
   parseCursorLabel(snap: ScreenSnapshot): string | null;
+  /** Positively identifies this driver's empty composer; unsupported drivers omit it. */
+  isIdleComposer?(snap: ScreenSnapshot): boolean;
   /**
    * A startup dialog waiting on a human before any prompt can land, or null.
    * Returns a short description for quoting back to the user.
@@ -222,6 +255,7 @@ export interface AgentDriver {
     ref: AgentRef,
     info: AskUserQuestionPaneInfo,
     text: string,
+    signal?: AbortSignal,
   ): Promise<void>;
   /** Free-text refinement of a pending plan-approval prompt. Absent = unsupported. */
   answerPlanFeedback?(
@@ -253,6 +287,8 @@ const REGISTRY: Record<string, AgentDriver> = {
   claude: claudeDriver,
   codex: codexDriver,
 };
+export const ORCA_AGENT_DRIVERS: readonly AgentDriver[] = Object.freeze(Object.values(REGISTRY));
+
 
 /** Unknown/missing agent kinds fall back to claude — preserves today's
  *  behavior for stale pairings and any herdr output this build doesn't

@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PairingStore } from "../pairing.js";
+import { PairingStore, type Pairing } from "../pairing.js";
 import { createTerminals, type SubmitContext, type Terminals } from "./index.js";
 import { BackendUnavailable, UnknownTarget, type AgentInfo, type AgentRef } from "./types.js";
 
@@ -71,14 +71,15 @@ function herdr(overrides: Partial<Terminals> = {}): Terminals {
 
 test("unprefixed Herdr IDs are passed through unchanged", async () => {
   let received: string | undefined;
-  const terminals = createTerminals(
-    herdr({
+  const terminals = createTerminals({
+    herdr: herdr({
       async get(target) {
         received = target;
         return agent(target);
       },
     }),
-  );
+    orca: null,
+  });
 
   const result = await terminals.get(PANE);
   assert.equal(received, PANE);
@@ -104,8 +105,8 @@ test("answer, model, and composer channels route to Herdr without changing the r
   };
   const blind = { async answer() {} };
   const composer = { async backTab() {} };
-  const terminals = createTerminals(
-    herdr({
+  const terminals = createTerminals({
+    herdr: herdr({
       openModelAnswer(received) {
         assert.equal(received, ref);
         return modelAnswer;
@@ -123,7 +124,8 @@ test("answer, model, and composer channels route to Herdr without changing the r
         return composer;
       },
     }),
-  );
+    orca: null,
+  });
 
   assert.equal(terminals.openAnswer(ref, {} as never), answer);
   assert.equal(terminals.openModelAnswer(ref, {} as never), modelAnswer);
@@ -133,8 +135,8 @@ test("answer, model, and composer channels route to Herdr without changing the r
 
 test("orca targets fail closed before reaching the Herdr backend", async () => {
   const calls: string[] = [];
-  const terminals = createTerminals(
-    herdr({
+  const terminals = createTerminals({
+    herdr: herdr({
       async get(target) {
         calls.push(`get:${target}`);
         return null;
@@ -152,7 +154,8 @@ test("orca targets fail closed before reaching the Herdr backend", async () => {
         return "accepted";
       },
     }),
-  );
+    orca: null,
+  });
   const target = "orca:42";
 
   await assert.rejects(terminals.get(target), UnknownTarget);
@@ -169,15 +172,63 @@ test("orca targets fail closed before reaching the Herdr backend", async () => {
   assert.throws(() => terminals.openBlind(ref, {} as never), UnknownTarget);
   assert.throws(() => terminals.openComposer(ref, {} as never), UnknownTarget);
 });
+test("enabled Orca routes explicitly and list combines backend results", async () => {
+  const target = "orca:tab-1:leaf-2";
+  const calls: string[] = [];
+  const terminals = createTerminals({
+    herdr: herdr({
+      async list() {
+        return { agents: [agent(PANE)], failures: [], complete: true, notices: [] };
+      },
+    }),
+    orca: herdr({
+      async list() {
+        return {
+          agents: [agent(target, "orca")],
+          failures: [{ backend: "orca", reason: "partial" }],
+          complete: false,
+          notices: ["hook notice"],
+        };
+      },
+      async get(received) {
+        calls.push(`get:${received}`);
+        return agent(received, "orca");
+      },
+      async exists(received) {
+        calls.push(`exists:${received}`);
+        return true;
+      },
+      async read(received) {
+        calls.push(`read:${received}`);
+        return { text: "screen", draft: null, complete: true };
+      },
+    }),
+  });
+
+  const listed = await terminals.list();
+  assert.deepEqual(listed.agents.map((item) => item.ref.target), [PANE, target]);
+  assert.deepEqual(listed.failures, [{ backend: "orca", reason: "partial" }]);
+  assert.equal(listed.complete, false);
+  assert.deepEqual(listed.notices, ["hook notice"]);
+  assert.equal((await terminals.get(target))?.backend, "orca");
+  assert.equal(await terminals.exists(target), true);
+  assert.deepEqual(await terminals.read(target, 20, "screen"), { text: "screen", draft: null, complete: true });
+  assert.deepEqual(calls, [`get:${target}`, `exists:${target}`, `read:${target}`]);
+
+  const orcaOnly = createTerminals({ herdr: null, orca: herdr() });
+  await assert.rejects(orcaOnly.get(PANE), UnknownTarget);
+});
+
 
 test("a Herdr result in the reserved Orca namespace raises a collision error", async () => {
-  const terminals = createTerminals(
-    herdr({
+  const terminals = createTerminals({
+    herdr: herdr({
       async get() {
         return agent("orca:herdr-collision");
       },
     }),
-  );
+    orca: null,
+  });
 
   await assert.rejects(terminals.get(PANE), BackendUnavailable);
 });
@@ -207,18 +258,121 @@ test("a pairing file without a backend field still loads and routes to Herdr", a
     assert.equal("backend" in pairing, false);
 
     const received: string[] = [];
-    const terminals = createTerminals(
-      herdr({
+    const terminals = createTerminals({
+      herdr: herdr({
         async get(target) {
           received.push(target);
           return agent(target);
         },
       }),
-    );
+      orca: null,
+    });
     const result = await terminals.get(pairing.paneId);
     assert.deepEqual(received, [PANE]);
     assert.equal(result?.backend, "herdr");
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Orca pairing round-trips its namespaced target and backend without a PID", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cctag-orca-pairing-"));
+  try {
+    const path = join(dir, "pairings.json");
+    const target = "orca:tab-7:leaf-2";
+    const pairing: Pairing = {
+      key: "C1:1.1",
+      channel: "C1",
+      threadTs: "1.1",
+      paneId: target,
+      backend: "orca",
+      terminalId: "orca-tab-7",
+      cwd: "/tmp/project",
+      pairedBy: "U1",
+      pairedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const store = new PairingStore(path);
+    store.add(pairing);
+
+    const saved = JSON.parse(readFileSync(path, "utf8")) as Array<Record<string, unknown>>;
+    assert.equal(saved[0].paneId, target);
+    assert.equal(saved[0].backend, "orca");
+    assert.equal("pid" in saved[0], false);
+
+    const restored = new PairingStore(path).get("C1", "1.1");
+    assert.ok(restored);
+    assert.equal(restored.paneId, target);
+    assert.equal(restored.backend, "orca");
+
+    const received: string[] = [];
+    const terminals = createTerminals({
+      herdr: herdr(),
+      orca: herdr({
+        async get(receivedTarget) {
+          received.push(receivedTarget);
+          return agent(receivedTarget, "orca");
+        },
+      }),
+    });
+    const live = await terminals.get(restored.paneId);
+    assert.deepEqual(received, [target]);
+    assert.equal(live?.backend, "orca");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("pairing store normalizes backend tags from target prefixes and warns on mismatches", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cctag-pairing-prefix-"));
+  const path = join(dir, "pairings.json");
+  const common = {
+    channel: "C1",
+    terminalId: "term_1",
+    cwd: "/tmp/project",
+    pairedBy: "U1",
+    pairedAt: "2026-01-01T00:00:00.000Z",
+  };
+  writeFileSync(
+    path,
+    JSON.stringify([
+      { ...common, key: "C1:1.1", threadTs: "1.1", paneId: "orca:tab-7:leaf-2" },
+      { ...common, key: "C1:2.1", threadTs: "2.1", paneId: "wT:p2", backend: "orca" },
+    ]),
+  );
+
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(" "));
+  try {
+    const store = new PairingStore(path);
+    const orcaPairing = store.get("C1", "1.1");
+    const herdrPairing = store.get("C1", "2.1");
+    assert.equal(orcaPairing?.backend, "orca");
+    assert.ok(herdrPairing);
+    assert.equal("backend" in herdrPairing, false);
+    assert.equal(warnings.length, 2);
+
+    store.add({
+      ...herdrPairing,
+      key: "C1:3.1",
+      threadTs: "3.1",
+      paneId: "orca:tab-8:leaf-1",
+      backend: undefined,
+    });
+    store.add({
+      ...herdrPairing,
+      key: "C1:4.1",
+      threadTs: "4.1",
+      paneId: "wT:p3",
+      backend: "orca",
+    });
+
+    const saved = JSON.parse(readFileSync(path, "utf8")) as Array<Record<string, unknown>>;
+    assert.equal(saved.find((pairing) => pairing.key === "C1:3.1")?.backend, "orca");
+    assert.equal("backend" in saved.find((pairing) => pairing.key === "C1:4.1")!, false);
+    assert.equal(warnings.length, 2, "new canonical records do not warn");
+  } finally {
+    console.warn = originalWarn;
     rmSync(dir, { recursive: true, force: true });
   }
 });

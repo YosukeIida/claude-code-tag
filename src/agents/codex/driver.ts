@@ -1,3 +1,5 @@
+import { basename } from "node:path";
+
 import type { AnswerChannel, Terminals } from "../../backend/index.js";
 import type { AgentInfo } from "../../backend/types.js";
 import { promptFingerprint } from "../fingerprint.js";
@@ -88,6 +90,15 @@ function splitModelAndLevel(words: string[]): { levelKey: string | null; modelWo
 
 export const codexDriver: AgentDriver = {
   kind: "codex",
+  orcaProcess: {
+    listable: false,
+    unsupportedNotice: "Orca 上の Codex は未対応です",
+    matchesCommand(command) {
+      const [executable] = command.trim().split(/\s+/);
+      return basename(executable ?? "") === "codex";
+    },
+  },
+
   displayName: "Codex CLI",
   readRegion: "screen",
 
@@ -98,6 +109,9 @@ export const codexDriver: AgentDriver = {
   extractTurnOutput(records) {
     const r = records as CodexRecord[];
     return { ...extractCodexTurnOutput(r), lifecycle: extractCodexLifecycle(r) };
+  },
+  extractLifecycle(records) {
+    return extractCodexLifecycle(records as CodexRecord[]);
   },
 
   parseStartupPrompt: parseCodexStartupPrompt,

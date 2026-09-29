@@ -3,6 +3,7 @@ import { classifiedStatus } from "../settle.js";
 import type { AskUserQuestionPaneInfo, PermissionMenu } from "../agents/driver.js";
 import { isDangerousSnippet, isRefusalLabel } from "../agents/driver.js";
 import type { MarkdownTable } from "./mrkdwn.js";
+import { backendForTarget } from "../backend/target.js";
 
 const STATUS_ICON: Record<string, string> = {
   idle: "🟢",
@@ -29,10 +30,10 @@ function dirLabel(cwd: string): string {
  * with each row showing the terminal title when available and a backend-provided
  * display ID otherwise.
  */
-export function agentPickerBlocks(result: ListResult) {
+export function agentPickerBlocks(result: ListResult, enabledBackends: readonly BackendName[]) {
   const agents = result.agents;
   if (agents.length === 0) {
-    const backends = new Set<BackendName>(["herdr", ...result.failures.map((failure) => failure.backend)]);
+    const backends = new Set<BackendName>([...enabledBackends, ...result.failures.map((failure) => failure.backend)]);
     const details = [
       ...result.failures.map((failure) => `⚠️ ${failure.backend}: ${failure.reason}`),
       ...result.notices.map((notice) => `ℹ️ ${notice}`),
@@ -51,10 +52,11 @@ export function agentPickerBlocks(result: ListResult) {
 
   const groups = new Map<string, { backend: BackendName; cwd: string; agents: AgentInfo[] }>();
   for (const agent of agents) {
-    const key = `${agent.backend}\0${agent.cwd}`;
+    const backend = backendForTarget(agent.ref.target);
+    const key = `${backend}\0${agent.cwd}`;
     const group = groups.get(key);
     if (group) group.agents.push(agent);
-    else groups.set(key, { backend: agent.backend, cwd: agent.cwd, agents: [agent] });
+    else groups.set(key, { backend, cwd: agent.cwd, agents: [agent] });
   }
 
   return [

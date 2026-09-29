@@ -1,6 +1,7 @@
 import type { BlindPermissionPrompt, VerifiedModelMenuPrompt, VerifiedPrompt } from "./prompt.js";
 import type { AgentDriver } from "../agents/driver.js";
 import { BackendUnavailable, type AgentInfo, type AgentRef, type ListResult, type ScreenSnapshot, UnknownTarget } from "./types.js";
+import { backendForTarget } from "./target.js";
 
 export * from "./types.js";
 
@@ -50,8 +51,9 @@ export interface Terminals {
   openComposer(ref: AgentRef, driver: AgentDriver): ComposerChannel;
 }
 
-function noOrcaBackend(target: string): never {
-  throw new UnknownTarget(`No Orca backend is available for target ${target}`);
+export interface TerminalBackends {
+  herdr: Terminals | null;
+  orca: Terminals | null;
 }
 
 function collisionMessage(agent: AgentInfo): string {
@@ -62,57 +64,82 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/** Routes the current herdr-only backend surface without rewriting existing herdr target IDs. */
-export function createTerminals(herdr: Terminals): Terminals {
-  const herdrFor = (target: string): Terminals => (target.startsWith("orca:") ? noOrcaBackend(target) : herdr);
+/** Routes explicit `orca:` targets and combines the enabled backends' lists. */
+export function createTerminals(backends: TerminalBackends): Terminals {
+  const enabled = (Object.entries(backends) as Array<["herdr" | "orca", Terminals | null]>).filter(
+    (entry): entry is ["herdr" | "orca", Terminals] => entry[1] !== null,
+  );
+  if (enabled.length === 0) throw new BackendUnavailable("No terminal backend is enabled");
+
+  const backendFor = (target: string): Terminals => {
+    const name = backendForTarget(target);
+    const backend = backends[name];
+    if (!backend) throw new UnknownTarget(`No ${name} backend is enabled for target ${target}`);
+    return backend;
+  };
 
   return {
     async list(): Promise<ListResult> {
-      let result: ListResult;
-      try {
-        result = await herdr.list();
-      } catch (err) {
-        return {
-          agents: [],
-          failures: [{ backend: "herdr", reason: errorMessage(err) }],
-          complete: false,
-          notices: [],
-        };
+      const agents: AgentInfo[] = [];
+      const failures: ListResult["failures"] = [];
+      const notices: string[] = [];
+      let complete = true;
+      const results = await Promise.all(
+        enabled.map(async ([name, backend]) => {
+          try {
+            return { name, ok: true as const, result: await backend.list() };
+          } catch (error) {
+            return { name, ok: false as const, error };
+          }
+        }),
+      );
+      for (const item of results) {
+        if (!item.ok) {
+          failures.push({ backend: item.name, reason: errorMessage(item.error) });
+          complete = false;
+          continue;
+        }
+        const collision = item.name === "herdr" ? item.result.agents.find((agent) => backendForTarget(agent.ref.target) === "orca") : null;
+        agents.push(
+          ...item.result.agents.filter((agent) => item.name !== "herdr" || backendForTarget(agent.ref.target) !== "orca"),
+        );
+        failures.push(...item.result.failures);
+        notices.push(...item.result.notices);
+        complete = complete && item.result.complete;
+        if (collision) {
+          failures.push({ backend: "herdr", reason: collisionMessage(collision) });
+          complete = false;
+        }
       }
-      const collision = result.agents.find((agent) => agent.ref.target.startsWith("orca:"));
-      if (!collision) return result;
-      return {
-        ...result,
-        agents: result.agents.filter((agent) => !agent.ref.target.startsWith("orca:")),
-        failures: [...result.failures, { backend: "herdr", reason: collisionMessage(collision) }],
-        complete: false,
-      };
+      return { agents, failures, complete, notices };
     },
     async get(target: string): Promise<AgentInfo | null> {
-      const agent = await herdrFor(target).get(target);
-      if (agent?.ref.target.startsWith("orca:")) throw new BackendUnavailable(collisionMessage(agent));
+      const agent = await backendFor(target).get(target);
+      if (backendForTarget(target) !== "orca" && agent && backendForTarget(agent.ref.target) === "orca") {
+        throw new BackendUnavailable(collisionMessage(agent));
+      }
       return agent;
     },
     exists(target: string): Promise<boolean> {
-      return herdrFor(target).exists(target);
+      return backendFor(target).exists(target);
     },
     read(target: string, lines: number, region: "screen" | "history"): Promise<ScreenSnapshot> {
-      return herdrFor(target).read(target, lines, region);
+      return backendFor(target).read(target, lines, region);
     },
     submit(ref: AgentRef, text: string, ctx: SubmitContext): Promise<SubmitOutcome> {
-      return herdrFor(ref.target).submit(ref, text, ctx);
+      return backendFor(ref.target).submit(ref, text, ctx);
     },
     openAnswer(ref: AgentRef, prompt: VerifiedPrompt) {
-      return herdrFor(ref.target).openAnswer(ref, prompt);
+      return backendFor(ref.target).openAnswer(ref, prompt);
     },
     openModelAnswer(ref: AgentRef, prompt: VerifiedModelMenuPrompt) {
-      return herdrFor(ref.target).openModelAnswer(ref, prompt);
+      return backendFor(ref.target).openModelAnswer(ref, prompt);
     },
     openBlind(ref: AgentRef, prompt: BlindPermissionPrompt) {
-      return herdrFor(ref.target).openBlind(ref, prompt);
+      return backendFor(ref.target).openBlind(ref, prompt);
     },
     openComposer(ref: AgentRef, driver: AgentDriver) {
-      return herdrFor(ref.target).openComposer(ref, driver);
+      return backendFor(ref.target).openComposer(ref, driver);
     },
   };
 }

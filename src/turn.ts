@@ -14,12 +14,21 @@ import {
   type SavedAttachment,
 } from "./attachments.js";
 import type { Terminals } from "./backend/index.js";
-import type { AgentInfo, AgentRef, BackendName } from "./backend/types.js";
+import {
+  ExpectationLost,
+  hasUnsendableC0Controls,
+  SubmitRefused,
+  UNSENDABLE_TEXT_MESSAGE,
+  WriteOutcomeUnknown,
+  WRITE_OUTCOME_UNKNOWN_MESSAGE,
+} from "./backend/types.js";
+import type { AgentInfo, AgentRef, AgentStatus, BackendName } from "./backend/types.js";
+import { backendForTarget } from "./backend/target.js";
 import { PaneLeaseRegistry, type PaneLease } from "./leases.js";
-import { classifiedStatus, SettleTracker } from "./settle.js";
+import { EMPTY_TRANSCRIPT_BOUNDARIES, resolveStatus, SettleTracker, transcriptBoundaries } from "./settle.js";
 import type { Pairing } from "./pairing.js";
 import { isUnsupportedByRemote, type MessageHandle, type Notifier } from "./notifier.js";
-import { readNewRecords, transcriptSizeSafe } from "./agents/transcript.js";
+import { readNewRecords, readRecentRecords, transcriptSizeSafe } from "./agents/transcript.js";
 import { driverFor, type AgentDriver, type AskUserQuestionPaneInfo, type BlockedPrompt } from "./agents/driver.js";
 import { promptFingerprint } from "./agents/fingerprint.js";
 import { chunkForSlack, markdownToMrkdwn } from "./slack/mrkdwn.js";
@@ -135,13 +144,11 @@ interface TurnState {
   /**
    * When to give up, as an absolute time rather than `startedAt + timeout`.
    *
-   * The distinction matters because a blocked pane is waiting on a person, and
-   * a person taking their time is not a stalled turn. Every poll that finds the
-   * pane blocked pushes this forward, so the timeout only ever measures how
-   * long the *agent* has gone without progress. Without that, an unanswered
-   * prompt timed out on schedule, the turn ended, and BackgroundWatcher — which
-   * adopts any blocked paired pane with no active turn — immediately re-adopted
-   * it and posted the same prompt again, once per timeout window, forever.
+   * A confirmed blocked status refreshes this deadline because the prompt is
+   * waiting on a person. An incomplete screen preserves the previous deadline,
+   * so a stale blocked status cannot extend an unreadable turn indefinitely.
+   * Without refreshing a confirmed prompt, it timed out on schedule, finalized
+   * the turn, and BackgroundWatcher re-adopted it and posted it once per timeout.
    */
   deadlineAt: number;
   /**
@@ -150,6 +157,8 @@ interface TurnState {
    * carries the turn's open/closed state, so it must not outlive it.
    */
   settle: SettleTracker;
+  /** Last resolved status, retained only for this turn's incomplete-screen path. */
+  previousStatus: AgentStatus;
   /**
    * Consecutive failures per terminal operation, each reset only by that same
    * operation succeeding.
@@ -171,14 +180,9 @@ interface TurnState {
    *  didn't parse — never compared in that case (see promptFingerprint). */
   promptFingerprint?: string | null;
   /**
-   * Set synchronously the moment an answer is accepted, before any input is
-   * sent, and cleared once the prompt is resolved or the attempt failed.
-   *
-   * The phase/prompt-id checks alone cannot serialize two answers: Slack buttons
-   * can be clicked twice, and both deliveries pass those checks before either
-   * reaches the state mutation that happens after `await`. Both then drive the
-   * TUI — for Codex that is digit-plus-Enter twice, whose second copy can land
-   * on whatever menu appeared next and confirm it.
+   * Set synchronously before any answer write, then cleared when the prompt is
+   * resolved or a pre-write attempt fails. An unknown write outcome clears the
+   * prompt ID but leaves this claimed until the pane presents a different prompt.
    */
   answering?: boolean;
   promptHandle?: MessageHandle;
@@ -358,6 +362,10 @@ export class TurnEngine {
       }
       if (lease.cancelled) return;
       const driver = driverFor(agent.agent);
+      const backend = backendForTarget(agent.ref.target);
+      if (backend === "orca" && hasUnsendableC0Controls(text)) {
+        throw new SubmitRefused("unsafe-text", UNSENDABLE_TEXT_MESSAGE);
+      }
 
       // Downloading happens here, inside the reservation, not in the caller:
       // a several-megabyte transfer can take a minute, and doing it before the
@@ -413,7 +421,7 @@ export class TurnEngine {
           await this.notifier.postReply(
             pairing.channel,
             pairing.threadTs ?? "",
-            `⚠️ ペインが起動時のダイアログで停止しています。ターミナルで応答してください。\n` +
+            `⚠️ ペインが起動時のダイアログで停止しています。このダイアログは端末で答えてください。\n` +
               `> ${question}\n` +
               `cctagは代わりに答えません（信頼の付与やツールチェーンの更新を含むため、` +
               `ディレクトリと環境を確認できる人が判断すべき項目です）。応答後にもう一度送ってください。`,
@@ -430,7 +438,7 @@ export class TurnEngine {
         pairing,
         requesterUserId,
         driver,
-        backend: agent.backend,
+        backend,
         ref: agent.ref,
         paneId: agent.ref.target,
         cwd: agent.cwd,
@@ -446,6 +454,7 @@ export class TurnEngine {
         startedAt: Date.now(),
         deadlineAt: Date.now() + this.opts.turnTimeoutMs,
         settle: new SettleTracker(),
+        previousStatus: "working",
         failures: { get: 0, read: 0 },
         lease,
         promptId: null,
@@ -470,13 +479,16 @@ export class TurnEngine {
       try {
         const canVerify = tPath !== "";
         const retries = prepared.imageCount > 0 && canVerify ? SUBMIT_RETRIES_WITH_IMAGES : 1;
-        await this.terminals.submit(agent.ref, normalized, {
+        const outcome = await this.terminals.submit(agent.ref, normalized, {
           driver,
           cancelled: () => lease.cancelled,
           transcriptGrew: () => (canVerify ? transcriptSizeSafe(tPath) > offset : null),
           retryLimit: retries,
           pollIntervalMs: this.opts.pollIntervalMs,
         });
+        if (backend === "orca" && outcome === "accepted") {
+          await statusHandle.update(`📨 ${backend} は入力を受け付けました。ターン開始を確認しています…`).catch(() => {});
+        }
       } catch (err) {
         // Input injection failed after the state was already registered —
         // roll it back so the terminal doesn't stay stuck "busy" forever.
@@ -607,6 +619,7 @@ export class TurnEngine {
         startedAt: Date.now(),
         deadlineAt: Date.now() + this.opts.turnTimeoutMs,
         settle: adoptedSettle,
+        previousStatus: "blocked",
         failures: { get: 0, read: 0 },
         lease,
         promptId: null,
@@ -675,8 +688,7 @@ export class TurnEngine {
         await state.driver.answerOption(channel, String(optionIndex + 1), label);
       }
     } catch (err) {
-      state.answering = false; // nothing was accepted; let the user try again
-      throw err;
+      return this.handleAnswerFailure(state, err);
     }
     await state.promptHandle?.update(askUserQuestionAnsweredText(info.header, label, actor), []).catch(() => {});
     this.markPromptResolved(state);
@@ -723,8 +735,7 @@ export class TurnEngine {
         state.lease.signal,
       );
     } catch (err) {
-      state.answering = false; // nothing was accepted; let the user try again
-      throw err;
+      return this.handleAnswerFailure(state, err);
     }
     const labels = chosen.map((i) => info.options[i].label).join(", ");
     await state.promptHandle?.update(askUserQuestionAnsweredText(info.header, labels, actor), []).catch(() => {});
@@ -767,10 +778,10 @@ export class TurnEngine {
         state.ref,
         info,
         freeText,
+        state.lease.signal,
       );
     } catch (err) {
-      state.answering = false;
-      throw err;
+      return this.handleAnswerFailure(state, err);
     }
     await state.promptHandle?.update(askUserQuestionAnsweredText(info.header, freeText), []).catch(() => {});
     this.markPromptResolved(state);
@@ -816,8 +827,7 @@ export class TurnEngine {
     try {
       await answer();
     } catch (err) {
-      state.answering = false;
-      throw err;
+      return this.handleAnswerFailure(state, err);
     }
     const by = actor ? `（${actor}）` : "";
     await state.promptHandle?.update(`→ ${num} を送信しました${by}`, []).catch(() => {});
@@ -851,6 +861,9 @@ export class TurnEngine {
       return { ok: false, reason: "not-pending" };
     }
 
+    if (state.backend === "orca" && hasUnsendableC0Controls(freeText)) {
+      throw new ExpectationLost(UNSENDABLE_TEXT_MESSAGE, UNSENDABLE_TEXT_MESSAGE);
+    }
     state.answering = true;
     try {
       await answer(
@@ -859,8 +872,7 @@ export class TurnEngine {
         freeText,
       );
     } catch (err) {
-      state.answering = false;
-      throw err;
+      return this.handleAnswerFailure(state, err);
     }
     await state.promptHandle?.update(`→ 修正を依頼しました: ${freeText}`, []).catch(() => {});
     this.markPromptResolved(state);
@@ -916,6 +928,17 @@ export class TurnEngine {
     if (!info) return "（ターミナル側で回答済み）";
     const options = info.options.map((o, i) => `${i + 1}. ${o.label}`).join("\n");
     return `❓ *${info.header}*: ${info.question}\n${options}\n\n（ターミナル側で回答済み）`;
+  }
+
+  private async handleAnswerFailure(state: TurnState, error: unknown): Promise<AnswerResult> {
+    if (error instanceof WriteOutcomeUnknown) {
+      state.promptId = null;
+      state.answering = true;
+      await state.promptHandle?.update(WRITE_OUTCOME_UNKNOWN_MESSAGE, []).catch(() => {});
+      return { ok: true };
+    }
+    state.answering = false;
+    throw error;
   }
 
   private markPromptResolved(state: TurnState): void {
@@ -1069,6 +1092,9 @@ export class TurnEngine {
         state.sessionId = agent.sessionId;
         state.transcriptPath = state.driver.locateTranscript(agent.cwd, agent.sessionId) ?? "";
         state.offset = 0;
+        // Session-local lifecycle and screen evidence must not leak to this transcript.
+        state.settle = new SettleTracker();
+        state.previousStatus = "working";
       } else if (!state.transcriptPath) {
         // Still no transcript (herdr may never report a sessionId at all —
         // e.g. its SessionStart hook is being blocked — so the branch above
@@ -1118,13 +1144,30 @@ export class TurnEngine {
       // has to come *before* the check below rather than after: while a prompt
       // is up the loop sleeps on a 5s floor, so a deadline refreshed only after
       // the check would already have lapsed by the time the next poll reads it.
-      // herdr's status, corrected where the transcript contradicts a `working`
-      // that will never clear (settle.ts). `blocked` is never rewritten, so
-      // everything below this line behaves exactly as it did for a real prompt.
-      const status = state.settle.effectiveStatus(classifiedStatus(agent.evidence));
-
+      // Shared resolution preserves herdr's classified correction and applies
+      // Orca's timestamp/status hints without confusing either with output offsets.
+      const boundaries =
+        agent.evidence.kind === "hint" && state.transcriptPath
+          ? transcriptBoundaries(state.driver.extractLifecycle(await readRecentRecords(state.transcriptPath)))
+          : EMPTY_TRANSCRIPT_BOUNDARIES;
+      const resolution = await resolveStatus({
+        evidence: agent.evidence,
+        settle: state.settle,
+        boundaries,
+        previousStatus: state.previousStatus,
+        readScreen: async () => {
+          const snapshot = await this.terminals.read(state.paneId, 40, "screen");
+          state.failures.read = 0;
+          return {
+            snapshot,
+            fingerprint: snapshot.complete ? promptFingerprint(state.driver.parseBlockedPane(snapshot.text)) : null,
+          };
+        },
+      });
+      const status = resolution.status;
+      state.previousStatus = status;
       const blocked = status === "blocked";
-      if (blocked) state.deadlineAt = Date.now() + this.opts.turnTimeoutMs;
+      if (resolution.extendDeadline) state.deadlineAt = Date.now() + this.opts.turnTimeoutMs;
 
       if (Date.now() > state.deadlineAt) {
         await this.finalize(state, "⚠️ タイムアウトしました（エージェントはまだ動作中の可能性があります）");
@@ -1145,9 +1188,13 @@ export class TurnEngine {
         // failed read.
         let paneText: string;
         try {
-          paneText = (
-            await this.terminals.read(state.paneId, BLOCKED_PANE_LINES, state.driver.readRegion)
-          ).text;
+          if (resolution.screen) {
+            paneText = resolution.screen.text;
+          } else {
+            paneText = (
+              await this.terminals.read(state.paneId, BLOCKED_PANE_LINES, state.driver.readRegion)
+            ).text;
+          }
           state.failures.read = 0;
         } catch (err) {
           state.failures.read += 1;

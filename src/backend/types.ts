@@ -1,6 +1,14 @@
 export type AgentStatus = "idle" | "working" | "blocked" | "done" | "unknown";
 
 export type BackendName = "herdr" | "orca";
+export const WRITE_OUTCOME_UNKNOWN_MESSAGE = "送信できたか確認できません。端末を確かめてください";
+export const UNSENDABLE_TEXT_MESSAGE = "入力に送信できない制御文字が含まれています。制御文字を除いてください。";
+
+const UNSENDABLE_C0_CONTROL = /[\u0000-\u0008\u000B-\u001F]/u;
+
+export function hasUnsendableC0Controls(value: string): boolean {
+  return UNSENDABLE_C0_CONTROL.test(value);
+}
 
 export type StatusEvidence =
   | { kind: "classified"; status: AgentStatus }
@@ -43,11 +51,23 @@ export class BackendUnavailable extends Error {}
 
 export class SubmitRefused extends Error {
   constructor(
-    readonly reason: "not-idle" | "draft" | "gate" | "incomplete-screen" | "agent-changed" | "cancelled",
+    readonly reason: "not-idle" | "draft" | "gate" | "incomplete-screen" | "agent-changed" | "cancelled" | "unsafe-text",
     message: string,
   ) {
     super(message);
   }
 }
 
-export class ExpectationLost extends Error {}
+export class ExpectationLost extends Error {
+  constructor(
+    message: string,
+    readonly userMessage?: string,
+  ) {
+    super(message);
+  }
+}
+export class WriteOutcomeUnknown extends Error {
+  constructor(cause?: unknown) {
+    super(WRITE_OUTCOME_UNKNOWN_MESSAGE, cause === undefined ? undefined : { cause });
+  }
+}

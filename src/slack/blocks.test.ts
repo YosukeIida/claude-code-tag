@@ -162,17 +162,18 @@ test("the agent picker groups by backend and cwd and preserves backend targets",
     terminalId: "herdr-terminal-id",
     displayId,
   });
+  const orcaTarget = `orca:${"x".repeat(73)}`;
   const result: ListResult = {
     agents: [
       agent("wT:p1", "herdr", "/work/project", "claude", "idle", "Claude session", "pane-1"),
       agent("wT:p2", "herdr", "/work/project", "codex", "working", null, "pane-2"),
-      agent("orca:42", "orca", "/work/project", "codex", "blocked", "Remote session", "orca:42"),
+      agent(orcaTarget, "orca", "/work/project", "codex", "blocked", "Remote session", "orca:42"),
     ],
     failures: [],
     complete: true,
     notices: [],
   };
-  const blocks = agentPickerBlocks(result) as unknown as Array<{
+  const blocks = agentPickerBlocks(result, ["herdr", "orca"]) as unknown as Array<{
     accessory: {
       option_groups: Array<{
         label: { text: string };
@@ -187,7 +188,9 @@ test("the agent picker groups by backend and cwd and preserves backend targets",
     "🟢 Claude session",
     "🟡 [codex] pane-2",
   ]);
-  assert.equal(groups[1].options[0].value, "orca:42");
+  assert.equal(groups[1].options[0].value, orcaTarget);
+  assert.equal(groups[1].options[0].value.length, 78);
+  assert.ok(groups[1].options[0].value.length <= 150, "the Orca target must fit Slack's option value limit");
   assert.equal(groups[1].options[0].text.text, "🔴 [codex] Remote session");
 });
 
@@ -196,11 +199,18 @@ test("an incomplete empty agent list explains backend failures and notices", () 
     agents: [],
     failures: [{ backend: "herdr", reason: "CLI unavailable" }],
     complete: false,
-    notices: ["Some entries were filtered."],
+    notices: [
+      "Orca 上の Codex は未対応です",
+      "orca:tab:leaf: セッションを特定できないため接続できません",
+      "Some entries were filtered.",
+    ],
   };
-  const text = JSON.stringify(agentPickerBlocks(result));
+  const text = JSON.stringify(agentPickerBlocks(result, ["herdr", "orca"]));
   assert.match(text, /herdr/);
+  assert.match(text, /現在 herdr \/ orca 上/, "enabled healthy backends belong in the empty-state message");
   assert.match(text, /CLI unavailable/);
+  assert.match(text, /Orca 上の Codex は未対応です/);
   assert.match(text, /不完全/);
+  assert.match(text, /セッションを特定できないため接続できません/);
   assert.match(text, /Some entries were filtered/);
 });

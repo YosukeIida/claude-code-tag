@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   looksLikeQuestionScreen,
   parseAskUserQuestionPane,
@@ -8,7 +9,7 @@ import {
 } from "./prompts.js";
 import { claudeDriver } from "./driver.js";
 import type { AnswerChannel, Terminals } from "../../backend/index.js";
-import type { AgentRef } from "../../backend/types.js";
+import type { AgentRef, ScreenSnapshot } from "../../backend/types.js";
 import { ExpectationLost } from "../../backend/types.js";
 
 const TEST_REF: AgentRef = { target: "w0:p1", pid: null, processStartedAt: null };
@@ -514,11 +515,73 @@ test("Claude cursor labels follow captured question and /model rows before and a
   assert.equal(claudeDriver.parseCursorLabel(snapshot("Select model\n  1. Opus\n  2. Sonnet")), null);
 });
 
-test("Claude cursor parser leaves an unnumbered Submit row unread", () => {
-  const snapshot = (text: string) => ({ text, draft: null, complete: true });
-  // Synthetic row to pin current behavior only; no selected-Submit live capture
-  // is available to justify parsing its cursor label.
-  assert.equal(claudeDriver.parseCursorLabel(snapshot("❯    Submit")), null);
+test("Claude cursor parser reads the captured unnumbered multi-select Submit row", () => {
+  assert.equal(
+    claudeDriver.parseCursorLabel(capturedScreen("ask-user-question-multiselect-submit-row.screen.json")),
+    "Submit",
+  );
+});
+
+test("Claude answer-review parser verifies complete choices and selected answers", () => {
+  const review = capturedScreen("ask-user-question-multiselect-review.screen.json");
+  const expected = {
+    question: "Which colors belong in a harmless sample palette?",
+    answers: ["Amber", "Jade"],
+  };
+  const verified = claudeDriver.parseAnswerReview?.(review, expected);
+  assert.ok(verified);
+  assert.equal(verified.form, "digit-confirms");
+
+  const reorderedAnswers = { ...review, text: review.text.replace("Amber, Jade", "Jade, Amber") };
+  assert.ok(claudeDriver.parseAnswerReview?.(reorderedAnswers, expected));
+  const changedAnswers = { ...review, text: review.text.replace("Amber, Jade", "Amber, Cobalt") };
+  const changedFingerprint = claudeDriver.parseAnswerReview?.(changedAnswers);
+  assert.ok(changedFingerprint);
+  assert.notEqual(changedFingerprint.fingerprint, verified.fingerprint);
+  assert.equal(claudeDriver.parseAnswerReview?.(changedAnswers, expected), null);
+  assert.equal(claudeDriver.parseAnswerReview?.({ ...review, complete: false }, expected), null);
+  assert.equal(
+    claudeDriver.parseAnswerReview?.(
+      { ...review, text: review.text.replace("Ready to submit your answers?", "Ready to submit?") },
+      expected,
+    ),
+    null,
+  );
+  assert.equal(
+    claudeDriver.parseAnswerReview?.({ ...review, text: review.text.replace("\n  2. Cancel", "") }, expected),
+    null,
+  );
+  assert.equal(
+    claudeDriver.parseAnswerReview?.(
+      { ...review, text: review.text.replace("❯ 1. Submit answers", "  1. Submit answers") },
+      expected,
+    ),
+    null,
+  );
+});
+test("Claude answer review rejects a later prompt and a Cancel cursor", () => {
+  const review = capturedScreen("ask-user-question-multiselect-review.screen.json");
+  const expected = {
+    question: "Which colors belong in a harmless sample palette?",
+    answers: ["Amber", "Jade"],
+  };
+  const laterQuestion = [
+    " ☐ Later question",
+    "Later question: choose the replacement answer?",
+    "  1. Keep",
+    "  2. Change",
+    "  3. Type something.",
+  ].join("\n");
+  assert.equal(
+    claudeDriver.parseAnswerReview?.({ ...review, text: `${review.text}\n${laterQuestion}` }, expected),
+    null,
+  );
+
+  const cancelSelected = review.text.replace(
+    "❯ 1. Submit answers\n  2. Cancel",
+    "  1. Submit answers\n❯ 2. Cancel",
+  );
+  assert.equal(claudeDriver.parseAnswerReview?.({ ...review, text: cancelSelected }, expected), null);
 });
 
 
@@ -798,4 +861,91 @@ test("free text on a single-select dialog still submits with the one Enter", asy
   const { herdr, channel, sent } = fakeHerdr(() => PREVIEW_PANE);
   await claudeDriver.answerQuestionFreeText!(herdr, channel, TEST_REF, PREVIEW_INFO, "別の案がある");
   assert.deepEqual(sent, ["key:Down", "key:Down", "text:別の案がある", "key:Enter"]);
+});
+
+interface ScreenCapture {
+  terminal?: {
+    tail?: unknown;
+    draft?: unknown;
+    source?: unknown;
+    status?: unknown;
+    truncated?: unknown;
+    limited?: unknown;
+  };
+}
+
+function capturedScreen(filename: string): ScreenSnapshot {
+  const capture = JSON.parse(
+    readFileSync(new URL(`./__fixtures__/${filename}`, import.meta.url), "utf8"),
+  ) as ScreenCapture;
+  const terminal = capture.terminal ?? {};
+  const rawTail = terminal.tail;
+  const tail = Array.isArray(rawTail) ? rawTail : [];
+  const lines = tail.filter((line): line is string => typeof line === "string");
+  return {
+    text: lines.join("\n"),
+    draft: typeof terminal.draft === "string" ? terminal.draft : null,
+    complete:
+      Array.isArray(rawTail) &&
+      lines.length === tail.length &&
+      terminal.source === "screen" &&
+      terminal.status === "running" &&
+      terminal.truncated === false &&
+      terminal.limited === false,
+  };
+}
+
+function isIdleComposer(snapshot: ScreenSnapshot): boolean {
+  return claudeDriver.isIdleComposer?.(snapshot) === true;
+}
+
+test("Claude recognizes a complete captured empty composer", () => {
+  assert.equal(isIdleComposer(capturedScreen("idle-composer.screen.json")), true);
+});
+
+test("Claude rejects the active ✳ status row by shape, independent of its verb", () => {
+  const working = capturedScreen("working.screen.json");
+  assert.equal(isIdleComposer(working), false);
+
+  const alternateVerb = working.text.replace(/^(\s*✳\s+)\S+/mu, "$1Waddling…");
+  assert.notEqual(alternateVerb, working.text, "the captured active status row must be present");
+  assert.equal(isIdleComposer({ ...working, text: alternateVerb }), false);
+});
+
+test("Claude rejects open question and model menus", () => {
+  for (const filename of [
+    "ask-user-question-before-down.screen.json",
+    "ask-user-question-after-down.screen.json",
+    "model-menu-before-down.screen.json",
+    "model-menu-after-down.screen.json",
+  ]) {
+    assert.equal(isIdleComposer(capturedScreen(filename)), false, filename);
+  }
+});
+
+test("Claude recognizes cancelled question and model menus after they return to the idle composer", () => {
+  for (const filename of [
+    "ask-user-question-cancelled.screen.json",
+    "model-menu-cancelled.screen.json",
+  ]) {
+    assert.equal(isIdleComposer(capturedScreen(filename)), true, filename);
+  }
+});
+
+test("Claude requires a complete screen and an empty composer row", () => {
+  const idle = capturedScreen("idle-composer.screen.json");
+  assert.equal(isIdleComposer({ ...idle, complete: false }), false);
+
+  const typedComposer = idle.text.replace("\n❯\n", "\n❯ keep this draft\n");
+  assert.notEqual(typedComposer, idle.text, "the fixture must contain an empty composer row");
+  assert.equal(isIdleComposer({ ...idle, text: typedComposer, draft: null }), false);
+});
+
+test("a redacted shell prompt is not a Claude composer", () => {
+  const shell = capturedScreen("shell-prompt.screen.json");
+  assert.equal(shell.complete, false, "the source capture is truncated");
+  assert.equal(isIdleComposer(shell), false);
+  // Isolate the parser shape as well; the captured text has no Claude prompt
+  // box even when supplied as a complete-screen excerpt.
+  assert.equal(isIdleComposer({ ...shell, complete: true }), false);
 });

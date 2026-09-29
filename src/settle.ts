@@ -1,4 +1,4 @@
-import type { AgentStatus, StatusEvidence } from "./backend/types.js";
+import type { AgentStatus, ScreenSnapshot, StatusEvidence } from "./backend/types.js";
 import type { TurnLifecycleEvent } from "./agents/driver.js";
 
 export function classifiedStatus(evidence: StatusEvidence): AgentStatus {
@@ -85,4 +85,99 @@ export class SettleTracker {
     if (status === "working" && this.settledByTranscript) return "idle";
     return status;
   }
+}
+
+export interface TranscriptBoundaries {
+  lastStartAt: number | null;
+  lastEndAt: number | null;
+  lastBoundary: "started" | "ended" | null;
+}
+
+export const EMPTY_TRANSCRIPT_BOUNDARIES: TranscriptBoundaries = Object.freeze({
+  lastStartAt: null,
+  lastEndAt: null,
+  lastBoundary: null,
+});
+
+/** Most recent lifecycle event, plus the most recent timestamp for each side. */
+export function transcriptBoundaries(events: readonly TurnLifecycleEvent[]): TranscriptBoundaries {
+  let lastStartAt: number | null = null;
+  let lastEndAt: number | null = null;
+  let foundStart = false;
+  let foundEnd = false;
+  let lastBoundary: TranscriptBoundaries["lastBoundary"] = null;
+
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i]!;
+    const started = event.kind === "started";
+    if (lastBoundary === null) lastBoundary = started ? "started" : "ended";
+    if (started && !foundStart) {
+      foundStart = true;
+      lastStartAt = event.timestamp;
+    } else if (!started && !foundEnd) {
+      foundEnd = true;
+      lastEndAt = event.timestamp;
+    }
+    if (foundStart && foundEnd) break;
+  }
+
+  if (lastBoundary === null) return EMPTY_TRANSCRIPT_BOUNDARIES;
+  return { lastStartAt, lastEndAt, lastBoundary };
+}
+
+export interface StatusScreenEvidence {
+  snapshot: ScreenSnapshot;
+  fingerprint: string | null;
+}
+
+export interface StatusResolution {
+  status: AgentStatus;
+  /** TurnEngine extends its deadline only when this is true. */
+  extendDeadline: boolean;
+  /** Complete screen retained so TurnEngine can reuse it if this resolution blocks. */
+  screen?: ScreenSnapshot;
+}
+
+export async function resolveStatus(input: {
+  evidence: StatusEvidence;
+  settle: SettleTracker;
+  boundaries: TranscriptBoundaries;
+  previousStatus: AgentStatus;
+  readScreen?: () => Promise<StatusScreenEvidence | null>;
+}): Promise<StatusResolution> {
+  if (input.evidence.kind === "classified") {
+    const status = input.settle.effectiveStatus(input.evidence.status);
+    return { status, extendDeadline: status === "blocked" };
+  }
+
+  const { waitingSince, state } = input.evidence;
+  if (waitingSince !== null && (input.boundaries.lastEndAt === null || input.boundaries.lastEndAt < waitingSince)) {
+    // A null end timestamp cannot prove that the turn ended after waiting began;
+    // treat it like no timed end so an existing blocked state is never released.
+    return { status: "blocked", extendDeadline: true };
+  }
+
+  if (input.boundaries.lastBoundary === "started") {
+    let screen: StatusScreenEvidence | null;
+    try {
+      screen = (await input.readScreen?.()) ?? null;
+    } catch {
+      screen = null;
+    }
+    if (!screen?.snapshot.complete) {
+      // Do not extend: repeated unreadable screens must not keep a turn alive forever; no key is sent while unreadable.
+      return { status: input.previousStatus, extendDeadline: false };
+    }
+    const blocked = screen.fingerprint !== null;
+    return {
+      status: blocked ? "blocked" : "working",
+      extendDeadline: blocked,
+      screen: screen.snapshot,
+    };
+  }
+
+  if (input.boundaries.lastBoundary === "ended") return { status: "idle", extendDeadline: false };
+  if (state === "working") return { status: "working", extendDeadline: false };
+  if (state === "done") return { status: "idle", extendDeadline: false };
+  return { status: "unknown", extendDeadline: false };
 }

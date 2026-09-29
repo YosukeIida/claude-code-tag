@@ -7,11 +7,10 @@ This document explains how cctag works internally (for setup steps, see the [REA
 **cctag bridges a Slack thread to a coding-agent terminal session running on
 your own machine.**
 
-It remote-controls **a coding-agent session you are actually running on your
-own PC right now**. Start `claude` (or `codex`) in your terminal, and you can
-talk to that exact session from Slack — send it instructions and get its
-replies back. Nothing is copied to a sandbox, so your local files and network
-(internal servers, GPUs, local model endpoints) are reachable as they are.
+The Herdr backend can submit messages to and read replies from an agent you
+are running locally. The optional Orca backend currently discovers and reads
+Claude Code terminals but does not send input. Both keep the agent and local
+files on your machine; nothing is copied to a sandbox.
 
 How that compares to tools that start a fresh session instead — and where
 those are the better choice — is [comparison.md](comparison.md). This document
@@ -19,16 +18,16 @@ only explains the mechanism.
 
 This walkthrough uses Claude Code throughout, because the details that are
 worth explaining — transcript layout, how a pending question is detected,
-Plan Mode — are its own. Codex CLI is supported the same way, via a
-per-pane driver chosen from what herdr reports is running; see the agent
-support table in the [README](../README.md) for what differs.
+Plan Mode — are its own. Herdr supports Claude Code and Codex CLI through
+per-pane drivers; Orca currently discovers Claude Code for read-only access.
+See the agent support table in the [README](../README.md) for what differs.
 
 ```
 Slack thread (@cctag)
         ↕
    cctag (Hub / Spoke)
         ↕
-      herdr
+   Herdr or Orca (local)
         ↕
    Claude Code (on your PC)
 ```
@@ -40,8 +39,8 @@ roles.
 
 | | Role | Runs on | Can do |
 |---|---|---|---|
-| **Hub** | The one connection to Slack | A small always-on server (e.g. a small cloud VM) | Receives Slack messages and forwards them to the right person's Spoke. **Never touches Claude Code or herdr itself** |
-| **Spoke** | The thing that actually drives Claude Code | **Your own PC** | Sends keystrokes into your local Claude Code via herdr, reads its output, and relays it back to Slack through the Hub |
+| **Hub** | The one connection to Slack | A small always-on server (e.g. a small cloud VM) | Receives Slack messages and forwards them to the right person's Spoke. **Never touches Claude Code or the local terminal backends** |
+| **Spoke** | The local terminal connection | **Your own PC** | Lists and reads agents through enabled backends; Herdr also sends input. Orca is read-only in this implementation |
 
 The important part: **the Hub has no way to reach your terminal.** Even if
 the Hub's server were compromised, it has no ability to control the Claude
@@ -51,9 +50,10 @@ from Slack needs to have **their own Spoke running on their own PC**.
 
 ## 3. How this relates to herdr: why only "running agents" show up
 
-cctag doesn't drive the terminal directly — it goes through
-[herdr](https://herdr.dev). There are two layers to how that scopes things
-down.
+cctag's Herdr backend talks to
+[herdr](https://herdr.dev), whose agent registry narrows the available
+panes. Orca is a separate backend with a different discovery path, described
+below.
 
 ### herdr itself can write to any pane
 
@@ -64,23 +64,24 @@ just a plain shell. The in-house bridge that used raw tmux before herdr
 (cc-slack-bridge v4) used exactly this raw power — it could send anything
 to a hardcoded pane number, for better or worse.
 
-### Only self-reported panes show up in the "agent list"
+### Only supported agents registered with herdr show up in the "agent list"
 
-On the other hand, what shows up in `herdr agent list` (the command cctag
-uses to build the `@cctag connect` picker) is **only panes where Claude
-Code itself has told herdr "I'm running here."** Claude Code has a
-`SessionStart` hook that fires on startup and reports to herdr's socket:
-"session ID xxx is running in this pane." Only once that report arrives
-does the pane get listed as an "agent."
+What appears in `herdr agent list` (the command cctag uses to build the
+`@cctag connect` picker) depends on Herdr's supported agent integrations, not
+on every managed pane. Start Claude Code or Codex CLI with `herdr agent start`
+and install its matching `herdr integration`; the integration supplies
+agent-specific session reporting. Claude Code's `SessionStart` hook reports
+its session ID. Codex CLI can appear in the list without one; trusting its
+`herdr-agent-state.sh` `SessionStart` hook adds full session-ID reporting, and
+cctag otherwise falls back to the paired terminal's working directory.
 
-So even when herdr is managing many panes, `herdr agent list` shows only
-the ones where Claude Code is running and self-reporting. The rest (plain
-shells, etc.) show up in `herdr pane list` but never in `herdr agent list`.
+Plain shells and processes not registered as agents remain visible in
+`herdr pane list` but do not appear in `herdr agent list`.
 
-### What actually makes cctag safe is choosing not to use that raw power
+### What makes the Herdr path safe is choosing not to use that raw power
 
-herdr is just as capable as tmux underneath, but **cctag's code imposes its
-own rule: only ever operate on a `pane_id` that came from `herdr agent
+Herdr is just as capable as tmux underneath, but **cctag's Herdr path imposes
+its own rule: only ever operate on a `pane_id` that came from `herdr agent
 list`/`agent get`.** There's no Slack command that lets you target an
 arbitrary pane.
 
@@ -90,21 +91,34 @@ pairing survives quitting the CLI and restarting it in the same pane.)
 
 Put together:
 
-- **herdr's self-reported registry** narrows down what's even a *candidate*
-  (only panes running Claude Code)
+- **Herdr's agent registry** limits candidates to supported, registered CLI
+  agents (Claude Code and Codex CLI), not every managed pane
 - **cctag's implementation choice** narrows down what it will actually
   *operate on* (only things discovered via the agent list)
 
-Both together are what produce the safe behavior of "only touches running
-Claude Code agents, can't freely drive an arbitrary terminal." herdr the
-tool doesn't forbid this on its own — it's a restriction that comes from
-how cctag chooses to use it.
+Together, these rules let cctag operate only on supported agents in registered
+panes; Herdr's raw pane commands remain capable of addressing arbitrary panes.
+
+### Orca is a separate, read-only backend
+
+When the Orca CLI is available (`CCTAG_ORCA_BIN`, default
+`/opt/homebrew/bin/orca`), cctag combines Orca's terminal and worktree
+metadata with the local Claude process tree. It joins a process to an Orca
+terminal by an exact `tabId:leafId` pane-key match. Only if no direct match
+exists may it use the process's `ORCA_TERMINAL_HANDLE`, and only when that
+handle names an explicitly orphaned terminal whose `tabId:leafId` pair is
+not another pane's ordinary key. Codex is recognized but not listed by this
+backend.
+
+This implementation can discover sessions, check whether their terminal is
+available, and read the screen. It cannot submit messages or answer prompts
+through Orca. Use a Herdr-backed pairing for interactive Slack control.
 
 ## 4. From `@cctag connect` to an actual conversation
 
 1. **`@cctag connect`** (owner only) → posts a Slack button menu built from
-   whatever `herdr agent list` finds — Claude Code and Codex CLI instances
-   alike
+   the enabled backends: Herdr's Claude Code/Codex agents and Orca's
+   read-only Claude Code terminals
 
    "Owner only" is not simply a narrowed permission. **The Spoke runs on the
    owner's own machine, so `connect` is choosing which of your own panes to
@@ -113,9 +127,12 @@ how cctag chooses to use it.
    paired, anyone in the thread can talk to it (see "What this actually looks
    like in use" in the [README](../README.md)) — so what is restricted is
    *deciding what to attach*, not *using it*.
-2. Pick one → that thread (channel + thread_ts) and the chosen pane_id
-   are recorded as a "pairing" (one thread per pane at a time)
-3. In a paired thread, sending **`@cctag <message>`**:
+2. Pick one → that thread (channel + thread_ts) and the backend-qualified
+   target (a Herdr pane or `orca:<paneKey>`) are recorded as a pairing
+
+   Orca-backed entries in this implementation support discovery and screen
+   reads only. Message submission and prompt answering require Herdr.
+3. For a Herdr-backed pairing, sending **`@cctag <message>`**:
    - Submits the text via herdr's `agent prompt`, which sends the text *and*
      the Enter in **one call**. Sending them separately raced Claude Code's
      paste handling: an Enter arriving before the injected text settled got

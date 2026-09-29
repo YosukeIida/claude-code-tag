@@ -1,12 +1,15 @@
+import type { AgentStatus, BackendName } from "./backend/types.js";
 import type { Terminals } from "./backend/index.js";
+import { backendForTarget } from "./backend/target.js";
 import type { Pairing, PairingStore } from "./pairing.js";
 import type { TurnEngine } from "./turn.js";
 import type { Notifier } from "./notifier.js";
 import { snapshotOutbox, WrittenFileTracker, type DirSnapshot } from "./attachments.js";
 import { postSegmented } from "./slack/post.js";
-import { readNewRecords, transcriptCreatedAfter, transcriptSizeSafe } from "./agents/transcript.js";
+import { readNewRecords, readRecentRecords, transcriptCreatedAfter, transcriptSizeSafe } from "./agents/transcript.js";
 import { driverFor } from "./agents/driver.js";
-import { classifiedStatus, SettleTracker } from "./settle.js";
+import { classifiedStatus, EMPTY_TRANSCRIPT_BOUNDARIES, resolveStatus, SettleTracker, transcriptBoundaries } from "./settle.js";
+import { promptFingerprint } from "./agents/fingerprint.js";
 import { chunkForSlack, markdownToMrkdwn } from "./slack/mrkdwn.js";
 
 function sleep(ms: number): Promise<void> {
@@ -14,13 +17,15 @@ function sleep(ms: number): Promise<void> {
 }
 
 interface WatchState {
+  pairingKey: string;
   sessionId: string;
   transcriptPath: string;
   offset: number;
   /** When this watch was (re)baselined. A transcript created after it holds
    *  nothing this watcher could already have reported. */
   startedAt: number;
-  lastStatus: string;
+  /** Last resolved status for this pairing, including incomplete-screen retention. */
+  lastStatus: AgentStatus;
   collected: string[];
   /** `<cwd>/.cctag/outbox` as of the last report, so terminal-initiated work
    *  gets its files attached too — see TurnEngine.uploadOutboxAdditions. */
@@ -81,14 +86,14 @@ export class BackgroundWatcher {
   private busyLastTick = new Set<string>();
   /** Consecutive check failures per pane, for log throttling only. */
   private failureStreak = new Map<string, number>();
-  /** Panes seen alive but without an agent -> when that was first seen. Both
-   *  throttles the log to once per spell and bounds how long the wait lasts
-   *  (AGENTLESS_GRACE_MS). */
+  /** Panes missing an agent, or temporarily absent from Orca during restart ->
+   *  when first observed; bounds the same restart grace for both cases. */
   private agentlessPanes = new Map<string, number>();
 
   private running = false;
 
   constructor(
+    private readonly backend: BackendName,
     private readonly terminals: Terminals,
     private readonly pairingStore: PairingStore,
     private readonly turnEngine: TurnEngine,
@@ -119,7 +124,7 @@ export class BackgroundWatcher {
   }
 
   private async tick(): Promise<void> {
-    const pairings = this.pairingStore.list();
+    const pairings = this.pairingStore.list().filter((pairing) => backendForTarget(pairing.paneId) === this.backend);
     const liveKeys = new Set(pairings.map((p) => p.paneId));
     for (const key of this.watches.keys()) {
       if (!liveKeys.has(key)) {
@@ -183,9 +188,8 @@ export class BackgroundWatcher {
     const agent = await this.terminals.get(pairing.paneId);
     if (!agent) {
       // "No agent" is not "no pane". Quitting the CLI to restart it in the same
-      // pane leaves a shell prompt: Herdr's get returns null while exists still
-      // returns true. A thrown Herdr error propagates, since a timeout is not a
-      // missing pane.
+      // pane leaves a shell prompt: get returns null while exists still returns
+      // true. BackendUnavailable throws into tick() and is never treated as absence.
       if (await this.terminals.exists(pairing.paneId)) {
         // Waited on, but not indefinitely. The grace period is what makes a
         // restart survivable; letting it run forever is what left threads
@@ -210,19 +214,21 @@ export class BackgroundWatcher {
         return;
       }
 
-      // Closing the terminal used to be invisible from Slack: the thread stayed
-      // paired and this returned quietly every 7s forever, so the only way to
-      // discover it was to send a message and get startTurn's agent-not-found.
-      // Reported once, from the same place that would have found the work.
-      //
-      // `null` specifically, never a thrown error: Herdr's get returns null only
-      // for its no-such-pane answer, and a timeout must not be reported as a
-      // closed terminal (tick() logs those). Same distinction the poll loop makes.
-      //
-      // The pairing is dropped rather than kept, matching what a message to a
-      // dead pane already does (commands.ts) — and a paneId is only unique
-      // within a herdr run, so a kept pairing could later attach this thread to
-      // whatever unrelated pane inherits the id.
+      // Only an explicit false result reaches this path. A backend error,
+      // including BackendUnavailable, throws into tick() and keeps the pairing.
+      // Orca can transiently miss an open pane during restart. Use the same
+      // bounded grace as the agentless path; Herdr's confirmed pane miss is
+      // still removed immediately.
+      if (backendForTarget(pairing.paneId) === "orca") {
+        const since = this.agentlessPanes.get(pairing.paneId);
+        this.watches.delete(pairing.paneId);
+        if (since === undefined) {
+          this.agentlessPanes.set(pairing.paneId, Date.now());
+          console.log(`[watcher:${backendForTarget(pairing.paneId)}] pane ${pairing.paneId} is temporarily unavailable — keeping ${pairing.key}`);
+          return;
+        }
+        if (Date.now() - since < this.agentlessGraceMs) return;
+      }
       await this.unpair(
         pairing,
         `pane ${pairing.paneId} is gone — unpaired ${pairing.key}`,
@@ -276,9 +282,10 @@ export class BackgroundWatcher {
       }
     }
 
-    if (!existing || sessionRotated || forceRebaseline) {
+    if (!existing || existing.pairingKey !== pairing.key || sessionRotated || forceRebaseline) {
       const tPath = driver.locateTranscript(agent.cwd, agent.sessionId) ?? "";
       this.watches.set(pairing.paneId, {
+        pairingKey: pairing.key,
         sessionId,
         transcriptPath: tPath,
         // Normally the end of the file: on first sight, on resuming after a turn,
@@ -316,13 +323,30 @@ export class BackgroundWatcher {
       state.settle.observe(output.lifecycle ?? []);
     }
 
-    // herdr's status, corrected where the transcript contradicts a `working`
-    // that will never clear (settle.ts). A pane stuck that way never reached
-    // the settle check below, so terminal-side output was collected here and
-    // then never posted.
-    const status = state.settle.effectiveStatus(classifiedStatus(agent.evidence));
+    // Both status paths use this resolver: herdr keeps the existing settle
+    // correction, while Orca compares its hint with a bounded transcript tail.
+    const boundaries =
+      agent.evidence.kind === "hint" && state.transcriptPath
+        ? transcriptBoundaries(driver.extractLifecycle(await readRecentRecords(state.transcriptPath)))
+        : EMPTY_TRANSCRIPT_BOUNDARIES;
+    const resolution = await resolveStatus({
+      evidence: agent.evidence,
+      settle: state.settle,
+      boundaries,
+      previousStatus: state.lastStatus,
+      readScreen: async () => {
+        const snapshot = await this.terminals.read(agent.ref.target, 40, "screen");
+        return {
+          snapshot,
+          fingerprint: snapshot.complete ? promptFingerprint(driver.parseBlockedPane(snapshot.text)) : null,
+        };
+      },
+    });
+    const status = resolution.status;
+    const previousStatus = state.lastStatus;
 
     if (status === "blocked") {
+      state.lastStatus = status;
       // The watch is dropped only if the engine actually took the handoff. It
       // used to be deleted first, so an adoption refused because a Slack turn
       // claimed the pane in the meantime threw away this state — the assistant
@@ -334,7 +358,7 @@ export class BackgroundWatcher {
         transcriptPath: state.transcriptPath,
         offset: state.offset,
         collected: state.collected,
-        backend: agent.backend,
+        backend: backendForTarget(agent.ref.target),
         paneId: agent.ref.target,
         ref: agent.ref,
         cwd: agent.cwd,
@@ -345,7 +369,7 @@ export class BackgroundWatcher {
       return;
     }
 
-    const wasActive = state.lastStatus === "working" || state.lastStatus === "blocked";
+    const wasActive = previousStatus === "working" || previousStatus === "blocked";
     const nowSettled = status === "idle" || status === "done";
 
     if (wasActive && nowSettled) {

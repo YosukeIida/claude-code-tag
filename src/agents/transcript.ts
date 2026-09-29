@@ -1,4 +1,7 @@
 import { createReadStream, statSync } from "node:fs";
+import { open } from "node:fs/promises";
+const RECENT_RECORD_LIMIT = 256;
+const RECENT_BYTE_LIMIT = 256 * 1024;
 
 export function transcriptSizeSafe(path: string): number {
   try {
@@ -91,4 +94,62 @@ export async function readNewRecords(
     }
   }
   return { records, newOffset };
+}
+
+/**
+ * Reads a bounded transcript suffix independently of any consumer's output
+ * offset. Returned records stay chronological; lifecycle callers scan their
+ * boundaries backwards to find the most recent start and end.
+ */
+export async function readRecentRecords(path: string): Promise<Record<string, unknown>[]> {
+  const file = await open(path, "r").catch(() => null);
+  if (!file) return [];
+
+  try {
+    const { size } = await file.stat();
+    if (size <= 0) return [];
+
+    const length = Math.min(size, RECENT_BYTE_LIMIT);
+    const start = size - length;
+    let startsAtRecordBoundary = start === 0;
+    if (start > 0) {
+      const precedingByte = Buffer.allocUnsafe(1);
+      const result = await file.read(precedingByte, 0, 1, start - 1);
+      startsAtRecordBoundary = result.bytesRead === 1 && precedingByte[0] === 0x0a;
+    }
+    const bytes = Buffer.allocUnsafe(length);
+    let used = 0;
+    while (used < length) {
+      const result = await file.read(bytes, used, length - used, start + used);
+      if (result.bytesRead === 0) break;
+      used += result.bytesRead;
+    }
+    if (used === 0) return [];
+
+    const text = bytes.subarray(0, used).toString("utf8");
+    const firstNewline = startsAtRecordBoundary ? -1 : text.indexOf("\n");
+    if (!startsAtRecordBoundary && firstNewline === -1) return [];
+    const suffix = startsAtRecordBoundary ? text : text.slice(firstNewline + 1);
+    const lastNewline = suffix.lastIndexOf("\n");
+    if (lastNewline === -1) return [];
+
+    const lines = suffix.slice(0, lastNewline).split("\n").slice(-RECENT_RECORD_LIMIT);
+    const records: Record<string, unknown>[] = [];
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const record = JSON.parse(line) as unknown;
+        if (typeof record === "object" && record !== null && !Array.isArray(record)) {
+          records.push(record as Record<string, unknown>);
+        }
+      } catch {
+        // Skip malformed transcript lines defensively.
+      }
+    }
+    return records;
+  } catch {
+    return [];
+  } finally {
+    await file.close().catch(() => {});
+  }
 }

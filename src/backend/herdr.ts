@@ -23,6 +23,7 @@ import {
   ExpectationLost,
   UnknownTarget,
 } from "./types.js";
+import { backendForTarget } from "./target.js";
 
 const execFileAsync = promisify(execFile);
 const NOT_FOUND = /not found|no such|unknown target/i;
@@ -54,7 +55,7 @@ function normalizeStatus(raw: string): AgentStatus {
 }
 
 function normalizeAgent(raw: RawAgent): AgentInfo {
-  if (raw.pane_id.startsWith("orca:")) {
+  if (backendForTarget(raw.pane_id) === "orca") {
     throw new BackendUnavailable(`herdr target collision: reserved orca: namespace returned as ${raw.pane_id}`);
   }
   return {
@@ -79,7 +80,7 @@ function evidenceStatus(evidence: StatusEvidence): AgentStatus {
 }
 
 function assertHerdrTarget(target: string): void {
-  if (target.startsWith("orca:")) throw new UnknownTarget(`No Orca backend is available for target ${target}`);
+  if (backendForTarget(target) === "orca") throw new UnknownTarget(`No Orca backend is available for target ${target}`);
 }
 
 

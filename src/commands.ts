@@ -1,12 +1,40 @@
 import type { IncomingFile } from "./attachments.js";
 import type { Terminals } from "./backend/index.js";
-import { ExpectationLost } from "./backend/types.js";
+import {
+  ExpectationLost,
+  SubmitRefused,
+  UNSENDABLE_TEXT_MESSAGE,
+  WRITE_OUTCOME_UNKNOWN_MESSAGE,
+  WriteOutcomeUnknown,
+  type BackendName,
+} from "./backend/types.js";
+import { backendForTarget } from "./backend/target.js";
 import { PairingStore } from "./pairing.js";
 import type { TurnEngine } from "./turn.js";
 import type { Notifier } from "./notifier.js";
 import { agentPickerBlocks } from "./slack/blocks.js";
 import { driverFor, type AgentDriver } from "./agents/driver.js";
 import { classifiedStatus } from "./settle.js";
+
+function submitRefusedText(reason: SubmitRefused["reason"], backend: BackendName): string {
+  switch (reason) {
+    case "not-idle":
+      return `⚠️ ${backend} は入力待ちではないため送信しませんでした。ターミナルの状態を確認してください。`;
+    case "draft":
+      return `⚠️ ${backend} の入力欄に未送信の文字があります。送信していません。ターミナルで確認してください。`;
+    case "gate":
+      return `⚠️ ${backend} のダイアログが送信を拒否しました。このダイアログは端末で答えてください。`;
+    case "incomplete-screen":
+      return `⚠️ ${backend} の画面を完全に確認できなかったため、送信しませんでした。`;
+    case "agent-changed":
+      return `⚠️ ${backend} の接続先エージェントが切り替わったため、送信しませんでした。再度送信してください。`;
+    case "cancelled":
+      return `⚠️ ${backend} への送信を中止しました。`;
+    case "unsafe-text":
+      return UNSENDABLE_TEXT_MESSAGE;
+  }
+}
+
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -235,6 +263,7 @@ export class CommandHandler {
     private readonly turnEngine: TurnEngine,
     private readonly notifier: Notifier,
     private readonly ownerUserId: string,
+    private readonly enabledBackends: readonly BackendName[] = ["herdr"],
   ) {}
 
   isOwner(userId: string): boolean {
@@ -372,7 +401,7 @@ export class CommandHandler {
           channel,
           threadTs,
           "接続するインスタンスを選択してください",
-          agentPickerBlocks(result),
+          agentPickerBlocks(result, this.enabledBackends),
         );
         return;
       }
@@ -498,6 +527,14 @@ export class CommandHandler {
       // the ordinary "wait your turn" case, not an error worth showing raw.
       if (err instanceof Error && err.message === "busy") {
         await this.notifier.postReply(channel, threadTs, BUSY_MESSAGE);
+        return;
+      }
+      if (err instanceof SubmitRefused) {
+        await this.notifier.postReply(channel, threadTs, submitRefusedText(err.reason, backendForTarget(pairing.paneId)));
+        return;
+      }
+      if (err instanceof WriteOutcomeUnknown) {
+        await this.notifier.postReply(channel, threadTs, WRITE_OUTCOME_UNKNOWN_MESSAGE);
         return;
       }
       await this.notifier.postReply(channel, threadTs, `❌ エラー: ${err instanceof Error ? err.message : String(err)}`);
@@ -687,6 +724,7 @@ export class CommandHandler {
       channel,
       threadTs,
       paneId: agent.ref.target,
+      ...(backendForTarget(agent.ref.target) === "orca" ? { backend: "orca" } : {}),
       terminalId: agent.terminalId,
       cwd: agent.cwd,
       agent: agent.agent,
@@ -711,15 +749,22 @@ export class CommandHandler {
    * agent_not_found while `pane get` still returned the pane.
    */
   private async reportAgentMissing(channel: string, threadTs: string, pairing: { key: string; paneId: string }): Promise<void> {
-    let paneStillThere = false;
+    const backend = backendForTarget(pairing.paneId);
+    let paneStillThere: boolean | undefined;
     try {
       paneStillThere = await this.terminals.exists(pairing.paneId);
     } catch {
-      // Couldn't tell — assume the pane is there, since keeping a pairing is the
-      // recoverable mistake and dropping one is not.
-      paneStillThere = true;
+      // Unknown availability is recoverable; only confirmed Herdr absence unpairs here.
     }
-    if (paneStillThere) {
+    if (backend === "orca" && paneStillThere !== true) {
+      await this.notifier.postReply(
+        channel,
+        threadTs,
+        "⚠️ 接続先のターミナルに現在到達できません。復帰しない場合は、猶予時間の後に自動的にペアリングを解除します。",
+      );
+      return;
+    }
+    if (paneStillThere !== false) {
       await this.notifier.postReply(
         channel,
         threadTs,
@@ -760,7 +805,7 @@ export class CommandHandler {
       }
     } catch (err) {
       if (!(err instanceof ExpectationLost)) throw err;
-      await this.notifier.postReply(ctx.channel, ctx.threadTs, EXPECTATION_LOST_REPLY);
+      await this.notifier.postReply(ctx.channel, ctx.threadTs, err.userMessage ?? EXPECTATION_LOST_REPLY);
     }
   }
 
@@ -790,7 +835,7 @@ export class CommandHandler {
       }
     } catch (err) {
       if (!(err instanceof ExpectationLost)) throw err;
-      await this.notifier.postReply(ctx.channel, ctx.threadTs, EXPECTATION_LOST_REPLY);
+      await this.notifier.postReply(ctx.channel, ctx.threadTs, err.userMessage ?? EXPECTATION_LOST_REPLY);
     }
   }
 
@@ -808,7 +853,7 @@ export class CommandHandler {
       }
     } catch (err) {
       if (!(err instanceof ExpectationLost)) throw err;
-      await this.notifier.postReply(ctx.channel, ctx.threadTs, EXPECTATION_LOST_REPLY);
+      await this.notifier.postReply(ctx.channel, ctx.threadTs, err.userMessage ?? EXPECTATION_LOST_REPLY);
     }
   }
 
@@ -832,7 +877,7 @@ export class CommandHandler {
       await this.turnEngine.answerPlanFeedback(pairing.paneId, ctx.text);
     } catch (err) {
       if (!(err instanceof ExpectationLost)) throw err;
-      await this.notifier.postReply(ctx.channel, ctx.threadTs, EXPECTATION_LOST_REPLY);
+      await this.notifier.postReply(ctx.channel, ctx.threadTs, err.userMessage ?? EXPECTATION_LOST_REPLY);
     }
   }
 }

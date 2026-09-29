@@ -6,7 +6,14 @@ import type { Terminals } from "./backend/index.js";
 import type { Notifier } from "./notifier.js";
 import type { Pairing, PairingStore } from "./pairing.js";
 import type { TurnEngine } from "./turn.js";
-import { ExpectationLost, type AgentInfo } from "./backend/types.js";
+import {
+  ExpectationLost,
+  SubmitRefused,
+  UNSENDABLE_TEXT_MESSAGE,
+  WRITE_OUTCOME_UNKNOWN_MESSAGE,
+  WriteOutcomeUnknown,
+  type AgentInfo,
+} from "./backend/types.js";
 
 const NO_TERMINALS = {} as Terminals;
 const OWNER = "U_OWNER";
@@ -67,6 +74,94 @@ test("connect stores Herdr's raw terminal_id, not the pane or picker name", asyn
   assert.equal(stored.length, 1);
   assert.equal(stored[0].paneId, "pane-id");
   assert.equal(stored[0].terminalId, "herdr-terminal-id");
+});
+
+test("connect stores Orca's namespaced target and backend without its PID", async () => {
+  const stored: Pairing[] = [];
+  const target = "orca:tab-7:leaf-2";
+  const agent: AgentInfo = {
+    ref: { target, pid: 420, processStartedAt: 123 },
+    backend: "orca",
+    agent: "codex",
+    sessionId: null,
+    cwd: "/tmp/orca-project",
+    evidence: { kind: "hint", state: null, waitingSince: null },
+    terminalTitle: null,
+    terminalId: "orca-tab-7",
+    displayId: target,
+  };
+  const terminals = {
+    async get(received: string) {
+      assert.equal(received, target);
+      return agent;
+    },
+  } as unknown as Terminals;
+  const pairingStore = {
+    byPane() {
+      return undefined;
+    },
+    add(pairing: Pairing) {
+      stored.push(pairing);
+    },
+  } as unknown as PairingStore;
+  const notifier = {
+    async postReply() {},
+  } as unknown as Notifier;
+  const handler = new CommandHandler(terminals, pairingStore, {} as TurnEngine, notifier, OWNER);
+
+  await handler.handlePairSelect({
+    channel: "C1",
+    threadTs: "1.1",
+    userId: OWNER,
+    terminalId: target,
+  });
+
+  assert.equal(stored.length, 1);
+  assert.equal(stored[0].paneId, target);
+  assert.equal(stored[0].backend, "orca");
+  assert.equal("pid" in stored[0], false);
+});
+
+test("connect's empty picker lists enabled backends and Orca diagnostics", async () => {
+  const result = {
+    agents: [],
+    failures: [{ backend: "herdr" as const, reason: "CLI unavailable" }],
+    complete: false,
+    notices: [
+      "Orca 上の Codex は未対応です",
+      "orca:tab-7:leaf-2: セッションを特定できないため接続できません",
+    ],
+  };
+  const terminals = { async list() { return result; } } as unknown as Terminals;
+  let postedBlocks: unknown[] = [];
+  const notifier = {
+    async postMessage(_channel: string, _threadTs: string, _text: string, blocks: unknown[]) {
+      postedBlocks = blocks;
+      return { async update() {} };
+    },
+  } as unknown as Notifier;
+  const handler = new CommandHandler(
+    terminals,
+    {} as PairingStore,
+    {} as TurnEngine,
+    notifier,
+    OWNER,
+    ["herdr", "orca"],
+  );
+
+  await handler.handleMention({
+    channel: "C1",
+    threadTs: "1.1",
+    userId: OWNER,
+    text: "connect",
+    ts: "1.2",
+  });
+
+  const text = JSON.stringify(postedBlocks);
+  assert.match(text, /現在 herdr \/ orca 上/);
+  assert.match(text, /CLI unavailable/);
+  assert.match(text, /Orca 上の Codex は未対応です/);
+  assert.match(text, /セッションを特定できないため接続できません/);
 });
 
 /** Posts a simulated permission button and reads back its prompt ID as Slack does. */
@@ -484,6 +579,19 @@ test("ExpectationLost from Slack answers tells the user to inspect the terminal"
     optionIndices: [0],
   });
   assert.deepEqual(replies.splice(0), [message]);
+  const reviewMessage = "確認画面を確かめられなかったので送信していません。端末で確かめてください";
+  await makeHandler({
+    async answerQuestionMultiSelect() {
+      throw new ExpectationLost(reviewMessage, reviewMessage);
+    },
+  }).handleAskUserQuestionMultiSelect({
+    channel: "C1",
+    threadTs: "1.1",
+    terminalId: BUTTON_PAIRING.paneId,
+    promptId: 1,
+    optionIndices: [0],
+  });
+  assert.deepEqual(replies.splice(0), [reviewMessage]);
 
   await makeHandler({
     async answerPermissionButton() {
@@ -529,4 +637,191 @@ test("ExpectationLost from Slack answers tells the user to inspect the terminal"
     }),
     /unexpected/,
   );
+});
+
+test("SubmitRefused reasons and unknown write outcomes reach Slack with safe instructions", async () => {
+  const pairing: Pairing = { ...BUTTON_PAIRING, paneId: "orca:tab-7:leaf-2", backend: "orca" };
+  const cases = [
+    ["not-idle", "⚠️ orca は入力待ちではないため送信しませんでした。ターミナルの状態を確認してください。"],
+    ["draft", "⚠️ orca の入力欄に未送信の文字があります。送信していません。ターミナルで確認してください。"],
+    ["gate", "⚠️ orca のダイアログが送信を拒否しました。このダイアログは端末で答えてください。"],
+    ["incomplete-screen", "⚠️ orca の画面を完全に確認できなかったため、送信しませんでした。"],
+    ["agent-changed", "⚠️ orca の接続先エージェントが切り替わったため、送信しませんでした。再度送信してください。"],
+    ["cancelled", "⚠️ orca への送信を中止しました。"],
+    ["unsafe-text", UNSENDABLE_TEXT_MESSAGE],
+  ] as const;
+  const replies: string[] = [];
+  const notifier = {
+    async postReply(_channel: string, _threadTs: string, text: string) {
+      replies.push(text);
+    },
+  } as unknown as Notifier;
+
+  for (const [reason, expected] of cases) {
+    const engine = {
+      isBusy: () => false,
+      async startTurn() {
+        throw new SubmitRefused(reason, "internal refusal");
+      },
+    } as unknown as TurnEngine;
+    const handler = new CommandHandler(
+      NO_TERMINALS,
+      { get: () => pairing } as unknown as PairingStore,
+      engine,
+      notifier,
+      OWNER,
+    );
+    await handler.handleMention({
+      channel: "C1",
+      threadTs: "1.1",
+      userId: OWNER,
+      text: "send this",
+      ts: "1.2",
+    });
+    assert.deepEqual(replies.splice(0), [expected], `Slack text for ${reason}`);
+  }
+
+  const unknownEngine = {
+    isBusy: () => false,
+    async startTurn() {
+      throw new WriteOutcomeUnknown();
+    },
+  } as unknown as TurnEngine;
+  await new CommandHandler(
+    NO_TERMINALS,
+    { get: () => pairing } as unknown as PairingStore,
+    unknownEngine,
+    notifier,
+    OWNER,
+  ).handleMention({
+    channel: "C1",
+    threadTs: "1.1",
+    userId: OWNER,
+    text: "send this",
+    ts: "1.3",
+  });
+  assert.deepEqual(replies, [WRITE_OUTCOME_UNKNOWN_MESSAGE]);
+});
+
+test("an Orca message-path miss keeps the pairing for watcher grace", async () => {
+  const pairing: Pairing = { ...BUTTON_PAIRING, paneId: "orca:tab-7:leaf-2" };
+  let existsCalls = 0;
+  let removed = 0;
+  const replies: string[] = [];
+  const terminals = {
+    async exists(target: string) {
+      assert.equal(target, pairing.paneId);
+      existsCalls++;
+      return false;
+    },
+  } as unknown as Terminals;
+  const engine = {
+    isBusy: () => false,
+    async startTurn() {
+      throw new Error("agent-not-found");
+    },
+  } as unknown as TurnEngine;
+  const pairingStore = {
+    get: () => pairing,
+    remove(key: string) {
+      assert.equal(key, pairing.key);
+      removed++;
+      return true;
+    },
+  } as unknown as PairingStore;
+  const notifier = {
+    async postReply(_channel: string, _threadTs: string, text: string) {
+      replies.push(text);
+    },
+  } as unknown as Notifier;
+
+  await new CommandHandler(terminals, pairingStore, engine, notifier, OWNER).handleMention({
+    channel: "C1",
+    threadTs: "1.1",
+    userId: OWNER,
+    text: "do the task",
+    ts: "1.2",
+  });
+
+  assert.equal(existsCalls, 1);
+  assert.equal(removed, 0, "the watcher, not one command-path miss, owns Orca unpairing");
+  assert.equal(replies.length, 1);
+  assert.match(replies[0]!, /ターミナル.*現在.*到達できません/);
+  assert.match(replies[0]!, /復帰しない場合/);
+  assert.match(replies[0]!, /自動.*解除/);
+  assert.doesNotMatch(replies[0]!, /ペアリングを解除しました/);
+});
+
+test("Herdr command-path confirmed absence still unpairs despite a stale Orca tag", async () => {
+  const pairing: Pairing = { ...BUTTON_PAIRING, backend: "orca" };
+  let removed = 0;
+  const replies: string[] = [];
+  const terminals = { async exists() { return false; } } as unknown as Terminals;
+  const engine = {
+    isBusy: () => false,
+    async startTurn() {
+      throw new Error("agent-not-found");
+    },
+  } as unknown as TurnEngine;
+  const pairingStore = {
+    get: () => pairing,
+    remove(key: string) {
+      assert.equal(key, pairing.key);
+      removed++;
+      return true;
+    },
+  } as unknown as PairingStore;
+  const notifier = {
+    async postReply(_channel: string, _threadTs: string, text: string) {
+      replies.push(text);
+    },
+  } as unknown as Notifier;
+
+  await new CommandHandler(terminals, pairingStore, engine, notifier, OWNER).handleMention({
+    channel: "C1",
+    threadTs: "1.1",
+    userId: OWNER,
+    text: "do the task",
+    ts: "1.2",
+  });
+
+  assert.equal(removed, 1);
+  assert.deepEqual(replies, ["⚠️ インスタンスが見つかりません。ペアリングを解除しました。"]);
+});
+
+test("submit refusal text uses the target prefix instead of a mismatched stored tag", async () => {
+  const cases: Array<{ pairing: Pairing; expected: string }> = [
+    {
+      pairing: { ...BUTTON_PAIRING, paneId: "orca:tab-7:leaf-2" },
+      expected: "⚠️ orca は入力待ちではないため送信しませんでした。ターミナルの状態を確認してください。",
+    },
+    {
+      pairing: { ...BUTTON_PAIRING, backend: "orca" },
+      expected: "⚠️ herdr は入力待ちではないため送信しませんでした。ターミナルの状態を確認してください。",
+    },
+  ];
+  for (const { pairing, expected } of cases) {
+    const replies: string[] = [];
+    const engine = {
+      isBusy: () => false,
+      async startTurn() {
+        throw new SubmitRefused("not-idle", "internal refusal");
+      },
+    } as unknown as TurnEngine;
+    const pairingStore = { get: () => pairing } as unknown as PairingStore;
+    const notifier = {
+      async postReply(_channel: string, _threadTs: string, text: string) {
+        replies.push(text);
+      },
+    } as unknown as Notifier;
+
+    await new CommandHandler(NO_TERMINALS, pairingStore, engine, notifier, OWNER).handleMention({
+      channel: "C1",
+      threadTs: "1.1",
+      userId: OWNER,
+      text: "do the task",
+      ts: "1.2",
+    });
+    assert.deepEqual(replies, [expected]);
+  }
 });

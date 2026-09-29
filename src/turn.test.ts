@@ -3,14 +3,21 @@ import assert from "node:assert/strict";
 import { TurnEngine } from "./turn.js";
 import { HerdrBackend } from "./backend/herdr.js";
 import type { AnswerChannel, Terminals } from "./backend/index.js";
-import { ExpectationLost, type AgentInfo, type AgentStatus } from "./backend/types.js";
+import {
+  ExpectationLost,
+  SubmitRefused,
+  WriteOutcomeUnknown,
+  type AgentInfo,
+  type AgentStatus,
+  type BackendName,
+} from "./backend/types.js";
 import type { Pairing } from "./pairing.js";
 import type { MessageHandle, Notifier } from "./notifier.js";
 import { claudeDriver } from "./agents/claude/driver.js";
 import { WrittenFileTracker } from "./attachments.js";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 const PANE = "wT:p1";
 
@@ -28,10 +35,10 @@ function permissionPane(command: string, cursorOn = 1): string {
 
 const PERMISSION_PANE = permissionPane("rm -rf build/");
 
-function fakeAgent(status: AgentStatus): AgentInfo {
+function fakeAgent(status: AgentStatus, backend: BackendName = "herdr"): AgentInfo {
   return {
     ref: { target: PANE, pid: null, processStartedAt: null },
-    backend: "herdr",
+    backend,
     agent: "claude",
     sessionId: "s1",
     cwd: "/tmp/nonexistent-cctag-test",
@@ -55,10 +62,20 @@ function fakePairing(): Pairing {
 }
 
 /** Records posted messages and button blocks so tests use the issued prompt ID. */
-function fakeNotifier(): { notifier: Notifier; posts: string[]; postedBlocks: unknown[][] } {
+function fakeNotifier(): {
+  notifier: Notifier;
+  posts: string[];
+  postedBlocks: unknown[][];
+  updates: Array<{ text: string; blocks: unknown[] }>;
+} {
   const posts: string[] = [];
   const postedBlocks: unknown[][] = [];
-  const handle: MessageHandle = { async update() {} };
+  const updates: Array<{ text: string; blocks: unknown[] }> = [];
+  const handle: MessageHandle = {
+    async update(text, blocks) {
+      updates.push({ text, blocks: blocks ?? [] });
+    },
+  };
   const notifier: Notifier = {
     async postReply(_c, _t, text) {
       posts.push(text);
@@ -69,7 +86,7 @@ function fakeNotifier(): { notifier: Notifier; posts: string[]; postedBlocks: un
       return handle;
     },
   };
-  return { notifier, posts, postedBlocks };
+  return { notifier, posts, postedBlocks, updates };
 }
 
 function promptIdInButtonBlock(value: unknown): number | undefined {
@@ -139,6 +156,7 @@ function fakeBackend(
   status: () => AgentStatus,
   pane: () => string = () => PERMISSION_PANE,
   overrides: Partial<FakeBackend> = {},
+  backendName: BackendName = "herdr",
 ): FakeBackend {
   return {
     async list() {
@@ -150,7 +168,7 @@ function fakeBackend(
       };
     },
     async get() {
-      return fakeAgent(status());
+      return fakeAgent(status(), backendName);
     },
     async exists() {
       return true;
@@ -193,16 +211,16 @@ function engineFor(herdr: FakeBackend, notifier: Notifier, turnTimeoutMs: number
   );
 }
 
-function adopt(engine: TurnEngine, pairing: Pairing): Promise<boolean> {
+function adopt(engine: TurnEngine, pairing: Pairing, backend: BackendName = "herdr"): Promise<boolean> {
   return engine.adoptBlockedTerminal(pairing, {
-    backend: "herdr",
+    backend,
     driver: claudeDriver,
     sessionId: "s1",
     transcriptPath: "",
     offset: 0,
     collected: [],
     paneId: PANE,
-    ref: fakeAgent("blocked").ref,
+    ref: fakeAgent("blocked", backend).ref,
     cwd: "/tmp/nonexistent-cctag-test",
     outboxBaseline: {},
     writes: new WrittenFileTracker(),
@@ -212,6 +230,72 @@ function adopt(engine: TurnEngine, pairing: Pairing): Promise<boolean> {
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
+
+test("a new session does not inherit a blocked status on an incomplete screen", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "cctag-session-reset-"));
+  let transcriptDir = "";
+  let engine: TurnEngine | undefined;
+  let reads = 0;
+  const { notifier } = fakeNotifier();
+  try {
+    const transcriptPath = claudeDriver.locateTranscript(cwd, "session-new");
+    assert.ok(transcriptPath);
+    transcriptDir = dirname(transcriptPath);
+    mkdirSync(transcriptDir, { recursive: true });
+    writeFileSync(
+      transcriptPath,
+      `${JSON.stringify({
+        type: "user",
+        timestamp: "2026-09-27T14:48:48.520Z",
+        message: { role: "user", content: "new session" },
+      })}\n`,
+    );
+
+    const terminals = fakeBackend(() => "working", () => "", {
+      async get(): Promise<AgentInfo> {
+        return {
+          ...fakeAgent("working"),
+          backend: "orca",
+          sessionId: "session-new",
+          cwd,
+          evidence: { kind: "hint", state: "working", waitingSince: null },
+        };
+      },
+      async read() {
+        reads++;
+        return { text: "partial screen", draft: null, complete: false };
+      },
+    });
+    engine = new TurnEngine(
+      terminals,
+      notifier,
+      { turnTimeoutMs: 600_000, pollIntervalMs: 200, limits: { maxFileBytes: 1024, maxFileCount: 1 } },
+      { list: () => [fakePairing()] },
+    );
+
+    const adopted = await engine.adoptBlockedTerminal(fakePairing(), {
+      backend: "herdr",
+      driver: claudeDriver,
+      sessionId: "session-old",
+      transcriptPath: "",
+      offset: 0,
+      collected: [],
+      paneId: PANE,
+      ref: fakeAgent("blocked").ref,
+      cwd,
+      outboxBaseline: {},
+      writes: new WrittenFileTracker(),
+    });
+    assert.equal(adopted, true);
+    for (let i = 0; i < 30 && reads === 0; i++) await sleep(20);
+    await sleep(20); // let a stale blocked status enter its prompt-read path
+    assert.equal(reads, 1, "the new session must not reuse the old session's blocked status");
+  } finally {
+    engine?.abortAll();
+    if (transcriptDir) rmSync(transcriptDir, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
 
 test("an unanswered prompt is posted once and does not time out, however long it sits", async () => {
   // The reported failure: leaving a permission request alone produced repeated
@@ -470,6 +554,268 @@ test("a failed answer is not left claimed, so it can be retried", async () => {
     const retry = await engine.answerPermissionButton(PANE, promptId, "1", pairingKey);
     assert.deepEqual(retry, { ok: true }, "the same prompt must still be answerable after a failure");
     assert.equal(attempts, 2);
+  } finally {
+    engine.abortAll();
+  }
+});
+test("Orca unknown answer outcome retires the prompt and refuses the same button", async () => {
+  const warning = "送信できたか確認できません。端末を確かめてください";
+  const { notifier, postedBlocks, updates } = fakeNotifier();
+  let acceptedWrites = 0;
+  const terminals = fakeBackend(
+    () => "blocked",
+    () => PERMISSION_PANE,
+    {
+      openAnswer() {
+        return fakeAnswerChannel({
+          async digit() {
+            acceptedWrites++;
+            throw new WriteOutcomeUnknown();
+          },
+        });
+      },
+    },
+    "orca",
+  );
+  const engine = engineFor(terminals, notifier, 600_000);
+
+  try {
+    await adopt(engine, fakePairing(), "orca");
+    await sleep(200);
+    const promptId = promptIdFromPostedBlocks(postedBlocks);
+    const pairingKey = fakePairing().key;
+
+    assert.deepEqual(
+      await engine.answerPermissionButton(PANE, promptId, "1", pairingKey),
+      { ok: true },
+    );
+    assert.equal(acceptedWrites, 1);
+    const warningUpdate = updates.find((update) => update.text === warning);
+    assert.ok(warningUpdate, "the prompt message carries the uncertainty warning");
+    assert.deepEqual(warningUpdate.blocks, [], "the old answer buttons are removed");
+
+    assert.deepEqual(
+      await engine.answerPermissionButton(PANE, promptId, "1", pairingKey),
+      { ok: false, reason: "not-pending" },
+    );
+    assert.equal(acceptedWrites, 1, "the same button cannot send a second time");
+  } finally {
+    engine.abortAll();
+  }
+});
+
+test("Orca pre-write answer refusal leaves the button retryable", async () => {
+  const { notifier, postedBlocks } = fakeNotifier();
+  let attempts = 0;
+  const terminals = fakeBackend(
+    () => "blocked",
+    () => PERMISSION_PANE,
+    {
+      openAnswer() {
+        return fakeAnswerChannel({
+          async digit() {
+            attempts++;
+            if (attempts === 1) throw new ExpectationLost("process changed before send");
+          },
+        });
+      },
+    },
+    "orca",
+  );
+  const engine = engineFor(terminals, notifier, 600_000);
+
+  try {
+    await adopt(engine, fakePairing(), "orca");
+    await sleep(200);
+    const promptId = promptIdFromPostedBlocks(postedBlocks);
+    const pairingKey = fakePairing().key;
+
+    await assert.rejects(
+      engine.answerPermissionButton(PANE, promptId, "1", pairingKey),
+      ExpectationLost,
+    );
+    assert.deepEqual(
+      await engine.answerPermissionButton(PANE, promptId, "1", pairingKey),
+      { ok: true },
+    );
+    assert.equal(attempts, 2);
+  } finally {
+    engine.abortAll();
+  }
+});
+
+test("Orca plan feedback rejects C0 text before selecting an answer", async () => {
+  const { notifier } = fakeNotifier();
+  const planPane = [
+    "Claude has written up a plan and is ready to execute. Would you like to proceed?",
+    "",
+    "   ❯ 1. Yes, and use auto mode",
+    "     2. Yes, manually approve edits",
+    "     3. Tell Claude what to change",
+  ].join("\n");
+  let writes = 0;
+  const terminals = fakeBackend(
+    () => "blocked",
+    () => planPane,
+    {
+      openAnswer() {
+        return fakeAnswerChannel({
+          async digit() {
+            writes++;
+          },
+          async text() {
+            writes++;
+          },
+          async confirm() {
+            writes++;
+          },
+        });
+      },
+    },
+    "orca",
+  );
+  const engine = engineFor(terminals, notifier, 600_000);
+
+  try {
+    await adopt(engine, fakePairing(), "orca");
+    await sleep(200);
+    await assert.rejects(
+      engine.answerPlanFeedback(PANE, "\u001b[A\r"),
+      (error: unknown) => error instanceof ExpectationLost && error.userMessage?.includes("制御文字"),
+    );
+    assert.equal(writes, 0);
+  } finally {
+    engine.abortAll();
+  }
+});
+
+
+test("Orca rejects original C0 text before downloading attachments", async () => {
+  const target = `orca:${PANE}`;
+  const pairing: Pairing = { ...fakePairing(), paneId: target, backend: "orca" };
+  let downloads = 0;
+  const submitted: string[] = [];
+  const terminals = fakeBackend(
+    () => "idle",
+    () => "",
+    {
+      async get(receivedTarget) {
+        return {
+          ...fakeAgent("idle", "orca"),
+          ref: { target: receivedTarget, pid: 42, processStartedAt: 1 },
+          sessionId: null,
+        };
+      },
+      async submit(_ref, text) {
+        submitted.push(text);
+        return "accepted";
+      },
+    },
+    "orca",
+  );
+  const { notifier } = fakeNotifier();
+  const withFiles: Notifier = {
+    ...notifier,
+    async fetchIncomingFile() {
+      downloads++;
+      return null;
+    },
+  };
+  const engine = engineFor(terminals, withFiles, 600_000);
+
+  try {
+    await assert.rejects(
+      engine.startTurn(pairing, "U1", "\r", {
+        files: [{ id: "F1", name: "screen.png", size: 12 } as never],
+      }),
+      (error: unknown) => error instanceof SubmitRefused && error.reason === "unsafe-text",
+    );
+    assert.equal(downloads, 0, "unsafe original text must be refused before attachment I/O");
+    assert.deepEqual(submitted, []);
+    assert.equal(engine.isBusy(target), false);
+  } finally {
+    engine.abortAll();
+  }
+});
+
+test("Orca permits interior LF and TAB and reports an accepted write", async () => {
+  const target = `orca:${PANE}`;
+  const pairing: Pairing = { ...fakePairing(), paneId: target, backend: "orca" };
+  const text = "first line\n\tsecond line";
+  const submitted: string[] = [];
+  const terminals = fakeBackend(
+    () => "idle",
+    () => "",
+    {
+      async get(receivedTarget) {
+        return {
+          ...fakeAgent("idle", "orca"),
+          ref: { target: receivedTarget, pid: 42, processStartedAt: 1 },
+          sessionId: null,
+        };
+      },
+      async submit(_ref, submittedText) {
+        submitted.push(submittedText);
+        return "accepted";
+      },
+    },
+    "orca",
+  );
+  const { notifier, updates } = fakeNotifier();
+  const engine = engineFor(terminals, notifier, 600_000);
+
+  try {
+    await engine.startTurn(pairing, "U1", text);
+    assert.deepEqual(submitted, [text], "interior LF/TAB must survive normalization");
+    assert.ok(
+      updates.some(({ text: update }) => update.includes("orca は入力を受け付けました")),
+      "accepted writes need visible status feedback",
+    );
+  } finally {
+    engine.abortAll();
+  }
+});
+
+test("a startup dialog asks for a terminal-side answer instead of submitting", async () => {
+  // Captured Claude Code fresh-directory prompt, shared with startup-prompt.test.ts.
+  const startupDialog = [
+    " Accessing workspace:",
+    " /private/tmp/scratch/v3-workdir",
+    " Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known",
+    " open source project, or work from your team).",
+    " ❯ 1. Yes, I trust this folder",
+    "   2. No, exit",
+    " Enter to confirm · Esc to cancel",
+  ].join("\n");
+  const target = `orca:${PANE}`;
+  const pairing: Pairing = { ...fakePairing(), paneId: target, backend: "orca" };
+  let submits = 0;
+  const terminals = fakeBackend(
+    () => "idle",
+    () => startupDialog,
+    {
+      async get(receivedTarget) {
+        return {
+          ...fakeAgent("idle", "orca"),
+          ref: { target: receivedTarget, pid: 42, processStartedAt: 1 },
+          sessionId: null,
+        };
+      },
+      async submit() {
+        submits++;
+        return "accepted";
+      },
+    },
+    "orca",
+  );
+  const { notifier, posts } = fakeNotifier();
+  const engine = engineFor(terminals, notifier, 600_000);
+
+  try {
+    await engine.startTurn(pairing, "U1", "continue");
+    assert.equal(submits, 0);
+    assert.ok(posts.some((post) => post.includes("このダイアログは端末で答えてください")));
+    assert.ok(posts.some((post) => post.includes("Is this a project you created or one you trust?")));
   } finally {
     engine.abortAll();
   }
@@ -1020,6 +1366,55 @@ test("a confirmed SendUserFile that does upload logs the candidate count and the
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an incomplete list from either backend prevents automatic outbox uploads", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "cctag-incomplete-outbox-"));
+  try {
+    const outbox = join(cwd, ".cctag", "outbox");
+    mkdirSync(outbox, { recursive: true });
+    const candidate = join(outbox, "artifact.txt");
+    writeFileSync(candidate, "keep this file on disk");
+
+    const uploads: string[] = [];
+    const { notifier, posts } = fakeNotifier();
+    const withUpload: Notifier = {
+      ...notifier,
+      async uploadFile(_channel, _threadTs, args) {
+        uploads.push(args.filename);
+      },
+    };
+    for (const failedBackend of ["orca", "herdr"] as const) {
+      const pairing: Pairing =
+        failedBackend === "orca"
+          ? { ...fakePairing(), paneId: `orca:${PANE}`, backend: "orca" }
+          : fakePairing();
+      const terminals = fakeBackend(
+        () => "idle",
+        () => "",
+        {
+          async list() {
+            return {
+              agents: [],
+              failures: [{ backend: failedBackend, reason: "backend unavailable" }],
+              complete: false,
+              notices: [],
+            };
+          },
+        },
+      );
+      const engine = engineFor(terminals, withUpload, 600_000);
+      await engine.uploadOutboxAdditions(pairing, cwd, {}, []);
+    }
+
+    assert.deepEqual(uploads, []);
+    assert.equal(posts.filter((post) => post.includes("自動添付を見送りました")).length, 2);
+    assert.ok(posts.some((post) => post.includes("orcaのインスタンス一覧")));
+    assert.ok(posts.some((post) => post.includes("herdrのインスタンス一覧")));
+    assert.equal(readFileSync(candidate, "utf8"), "keep this file on disk");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
   }
 });
 

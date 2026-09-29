@@ -6,12 +6,13 @@ import { join } from "node:path";
 import { BackgroundWatcher } from "./watcher.js";
 import { PairingStore, type Pairing } from "./pairing.js";
 import type { Terminals } from "./backend/index.js";
-import type { AgentInfo, AgentStatus } from "./backend/types.js";
+import { BackendUnavailable, type AgentInfo, type AgentStatus } from "./backend/types.js";
 import type { MessageHandle, Notifier } from "./notifier.js";
 import type { TurnEngine } from "./turn.js";
 import { encodeCwd } from "./agents/claude/transcript.js";
 
 const PANE = "wG:p1";
+const ORCA_PANE = `orca:${PANE}`;
 
 function fakeAgent(
   status: AgentStatus = "idle",
@@ -31,15 +32,15 @@ function fakeAgent(
 }
 
 function fakeTerminals(
-  agent: () => AgentInfo | null | Promise<AgentInfo | null> = () => fakeAgent(),
+  agent: (target: string) => AgentInfo | null | Promise<AgentInfo | null> = () => fakeAgent(),
   paneExists: () => boolean | Promise<boolean> = () => true,
 ): Terminals {
   return {
     async list() {
       return { agents: [], failures: [], complete: true, notices: [] };
     },
-    async get() {
-      return agent();
+    async get(target: string) {
+      return agent(target);
     },
     async exists() {
       return paneExists();
@@ -90,6 +91,10 @@ function fakePairing(): Pairing {
   } as Pairing;
 }
 
+function orcaPairing(): Pairing {
+  return { ...fakePairing(), key: "C1:2.1", threadTs: "2.1", paneId: ORCA_PANE, backend: "orca" };
+}
+
 function fakeNotifier(): { notifier: Notifier; replies: string[] } {
   const replies: string[] = [];
   const handle: MessageHandle = { async update() {} };
@@ -108,9 +113,9 @@ function fakeNotifier(): { notifier: Notifier; replies: string[] } {
 /** A TurnEngine stand-in: nothing is ever busy, so every tick reaches checkPairing. */
 const idleEngine = { isBusy: () => false } as unknown as TurnEngine;
 
-function storeWithPairing(dir: string): PairingStore {
+function storeWithPairing(dir: string, pairing: Pairing = fakePairing()): PairingStore {
   const store = new PairingStore(join(dir, "pairings.json"));
-  store.add(fakePairing());
+  store.add(pairing);
   return store;
 }
 
@@ -131,7 +136,7 @@ test("a pane that has gone away is reported once and unpaired", async () => {
       () => false,
     );
 
-    const watcher = new BackgroundWatcher(herdr, store, idleEngine, notifier, 20);
+    const watcher = new BackgroundWatcher("herdr", herdr, store, idleEngine, notifier, 20);
     watcher.start();
     await sleep(150); // several ticks
     watcher.stop();
@@ -157,7 +162,7 @@ test("a herdr error is not reported as a closed terminal", async () => {
       throw new Error("herdr command timed out");
     });
 
-    const watcher = new BackgroundWatcher(herdr, store, idleEngine, notifier, 20);
+    const watcher = new BackgroundWatcher("herdr", herdr, store, idleEngine, notifier, 20);
     watcher.start();
     await sleep(150);
     watcher.stop();
@@ -187,7 +192,7 @@ test("a pane whose agent quit is kept while the CLI could still be restarting", 
     const store = storeWithPairing(dir);
     const { notifier, replies } = fakeNotifier();
 
-    const watcher = new BackgroundWatcher(agentlessTerminals(), store, idleEngine, notifier, 20, 10_000);
+    const watcher = new BackgroundWatcher("herdr", agentlessTerminals(), store, idleEngine, notifier, 20, 10_000);
     watcher.start();
     await sleep(150); // several ticks, all well inside the grace period
     watcher.stop();
@@ -208,7 +213,7 @@ test("a pane still agentless after the grace period is unpaired and reported onc
     const store = storeWithPairing(dir);
     const { notifier, replies } = fakeNotifier();
 
-    const watcher = new BackgroundWatcher(agentlessTerminals(), store, idleEngine, notifier, 20, 40);
+    const watcher = new BackgroundWatcher("herdr", agentlessTerminals(), store, idleEngine, notifier, 20, 40);
     watcher.start();
     await sleep(300); // ticks past the 40ms grace, then keeps ticking
     watcher.stop();
@@ -245,7 +250,7 @@ test("an agent coming back inside the grace period resets the wait", async () =>
       () => true,
     );
 
-    const watcher = new BackgroundWatcher(herdr, store, idleEngine, notifier, 50, 200);
+    const watcher = new BackgroundWatcher("herdr", herdr, store, idleEngine, notifier, 50, 200);
     watcher.start();
     await sleep(430);
     watcher.stop();
@@ -273,7 +278,7 @@ test("a pairing from before pane-id addressing is diagnosed as stale, not as a c
       return null;
     });
 
-    const watcher = new BackgroundWatcher(herdr, store, idleEngine, notifier, 20);
+    const watcher = new BackgroundWatcher("herdr", herdr, store, idleEngine, notifier, 20);
     watcher.start();
     await sleep(150);
     watcher.stop();
@@ -381,6 +386,7 @@ async function withRotationFixture(
       },
       start: () => {
         watcher = new BackgroundWatcher(
+          "herdr",
           rotatingTerminals(cwd, () => status),
           store,
           engine,
@@ -488,6 +494,32 @@ test("the CLI restarting in the same pane switches to the new transcript", async
   });
 });
 
+test("a replacement pairing drops collected output and status from the old thread", async () => {
+  await withRotationFixture(async ({ tDir, store, replies, setStatus, start }) => {
+    start();
+    await sleep(80);
+    writeTranscript(tDir, "session-a.jsonl", ["old thread output"]);
+    await sleep(120); // the watcher collects the response while the pane is working
+    assert.equal(replies.length, 0, "working output must remain collected, not posted");
+
+    store.remove(fakePairing().key);
+    store.add({
+      ...fakePairing(),
+      key: "C2:2.2",
+      channel: "C2",
+      threadTs: "2.2",
+    });
+    setStatus("idle");
+    await sleep(120);
+
+    assert.equal(
+      replies.filter((reply) => reply.includes("old thread output")).length,
+      0,
+      "a response collected for the removed pairing must not be posted to its replacement",
+    );
+  });
+});
+
 test("a transcript that already existed is still never replayed", async () => {
   // The false-positive side: re-resolving must not turn into dumping history
   // into the thread, which is the invariant this watcher is built around.
@@ -575,7 +607,7 @@ test("a pane whose CLI was quit keeps its pairing", async () => {
       () => true, // ...but the pane is still there
     );
 
-    const watcher = new BackgroundWatcher(herdr, store, idleEngine, notifier, 20);
+    const watcher = new BackgroundWatcher("herdr", herdr, store, idleEngine, notifier, 20);
     watcher.start();
     await sleep(150);
     watcher.stop();
@@ -597,13 +629,129 @@ test("a pane that is really gone is still unpaired", async () => {
       () => false,
     );
 
-    const watcher = new BackgroundWatcher(herdr, store, idleEngine, notifier, 20);
+    const watcher = new BackgroundWatcher("herdr", herdr, store, idleEngine, notifier, 20);
     watcher.start();
     await sleep(150);
     watcher.stop();
 
     assert.equal(store.list().length, 0);
     assert.equal(replies.filter((r) => r.includes("インスタンスが見つかりません")).length, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an Orca exists:false miss gets restart grace before unpairing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cctag-watcher-orca-grace-"));
+  try {
+    const store = storeWithPairing(dir, orcaPairing());
+    const { notifier, replies } = fakeNotifier();
+    let existsCalls = 0;
+    const orca = fakeTerminals(
+      () => null,
+      () => ++existsCalls > 1,
+    );
+    const watcher = new BackgroundWatcher("orca", orca, store, idleEngine, notifier, 20, 10_000);
+    watcher.start();
+    await sleep(110);
+    watcher.stop();
+
+    assert.ok(existsCalls >= 3, `expected repeated absence checks, got ${existsCalls}`);
+    assert.equal(store.list().length, 1, "one false presence result must not drop the Orca pairing");
+    assert.deepEqual(replies, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("repeated incomplete Orca presence checks do not start absence grace", async () => {
+  for (const failingOperation of ["get", "exists"] as const) {
+    const dir = mkdtempSync(join(tmpdir(), "cctag-watcher-orca-unavailable-"));
+    try {
+      const store = storeWithPairing(dir, orcaPairing());
+      const { notifier, replies } = fakeNotifier();
+      let calls = 0;
+      const orca = fakeTerminals(
+        async () => {
+          calls++;
+          if (failingOperation === "get") throw new BackendUnavailable("incomplete terminal list");
+          return null;
+        },
+        async () => {
+          calls++;
+          if (failingOperation === "exists") throw new BackendUnavailable("incomplete terminal list");
+          return false;
+        },
+      );
+      const watcher = new BackgroundWatcher("orca", orca, store, idleEngine, notifier, 20, 40);
+      watcher.start();
+      await sleep(110);
+      watcher.stop();
+
+      assert.equal(store.list().length, 1, `${failingOperation} failure must retain the pairing`);
+      assert.ok(calls >= 3, `incomplete presence queries must repeat beyond grace, got ${calls}`);
+      assert.deepEqual(replies, []);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("an Orca pane still missing after the restart grace is unpaired once", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cctag-watcher-orca-gone-"));
+  try {
+    const store = storeWithPairing(dir, orcaPairing());
+    const { notifier, replies } = fakeNotifier();
+    const watcher = new BackgroundWatcher("orca", fakeTerminals(() => null, () => false), store, idleEngine, notifier, 20, 40);
+    watcher.start();
+    await sleep(150);
+    watcher.stop();
+
+    assert.equal(store.list().length, 0);
+    assert.equal(replies.filter((reply) => reply.includes("インスタンスが見つかりません")).length, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a delayed Herdr check does not delay the independent Orca watcher", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cctag-watcher-independent-"));
+  try {
+    const store = new PairingStore(join(dir, "pairings.json"));
+    store.add(fakePairing());
+    store.add(orcaPairing());
+    const { notifier } = fakeNotifier();
+    let releaseHerdr: (() => void) | undefined;
+    const herdrBlocked = new Promise<void>((resolve) => {
+      releaseHerdr = resolve;
+    });
+    let herdrCalls = 0;
+    let orcaCalls = 0;
+    const herdr = fakeTerminals(async () => {
+      herdrCalls++;
+      await herdrBlocked;
+      throw new BackendUnavailable("delayed Herdr failure");
+    });
+    const orca = fakeTerminals(
+      async () => {
+        orcaCalls++;
+        return null;
+      },
+      () => true,
+    );
+    const herdrWatcher = new BackgroundWatcher("herdr", herdr, store, idleEngine, notifier, 20);
+    const orcaWatcher = new BackgroundWatcher("orca", orca, store, idleEngine, notifier, 20, 10_000);
+    herdrWatcher.start();
+    orcaWatcher.start();
+    await sleep(105);
+    herdrWatcher.stop();
+    orcaWatcher.stop();
+    releaseHerdr?.();
+    await sleep(10);
+
+    assert.equal(herdrCalls, 1, "the slow backend remains in its first check");
+    assert.ok(orcaCalls >= 3, `the other backend must keep ticking, got ${orcaCalls}`);
+    assert.equal(store.list().length, 2, "a slow or failing watcher must not unpair either target");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -674,6 +822,69 @@ function uploadRecordingEngine(): { engine: TurnEngine; handovers: string[][] } 
   return { engine, handovers };
 }
 
+test("Orca hint working-to-idle transition posts terminal output and file additions", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "cctag-orca-watch-"));
+  const tDir = transcriptDirFor(cwd);
+  const storeDir = mkdtempSync(join(tmpdir(), "cctag-orca-watch-store-"));
+  const filePath = join(cwd, "report.pdf");
+  let watcher: BackgroundWatcher | undefined;
+  let screenReads = 0;
+  try {
+    writeFileSync(filePath, "report");
+    const store = new PairingStore(join(storeDir, "pairings.json"));
+    store.add({ ...fakePairing(), cwd, paneId: ORCA_PANE, backend: "orca" });
+    const { notifier, replies } = fakeNotifier();
+    const { engine, handovers } = uploadRecordingEngine();
+    const agent: AgentInfo = {
+      ...fakeAgent("working", cwd),
+      ref: { target: ORCA_PANE, pid: 42, processStartedAt: 1 },
+      backend: "orca" as const,
+      sessionId: null,
+      evidence: { kind: "hint" as const, state: "working", waitingSince: null },
+    };
+    const terminals: Terminals = {
+      ...fakeTerminals(() => agent),
+      async read() {
+        screenReads++;
+        return { text: "", draft: null, complete: true };
+      },
+    };
+    watcher = new BackgroundWatcher("orca", terminals, store, engine, notifier, 20);
+    watcher.start();
+    await sleep(80); // first sight establishes the transcript baseline
+
+    appendRecords(tDir, "session-a.jsonl", [
+      TURN_START,
+      {
+        type: "assistant",
+        timestamp: "2026-09-27T14:48:53.416Z",
+        message: { role: "assistant", content: [{ type: "text", text: "terminal response" }] },
+      },
+      ...sendUserFile(filePath, "toolu_orca_1"),
+    ]);
+    for (let i = 0; i < 20 && screenReads === 0; i++) await sleep(20);
+    assert.ok(screenReads > 0, "the running transcript must reach the complete-screen row");
+
+    appendRecords(tDir, "session-a.jsonl", [turnEnd("terminal response")[1]]);
+    for (let i = 0; i < 20 && !replies.some((reply) => reply.includes("terminal response")); i++) {
+      await sleep(20);
+    }
+    watcher.stop();
+
+    assert.equal(
+      replies.filter((reply) => reply.includes("terminal response")).length,
+      1,
+      "the saved working status must trigger one terminal-side response on idle",
+    );
+    assert.deepEqual(handovers, [[filePath]], "file additions must be handed over on the same transition");
+  } finally {
+    watcher?.stop();
+    rmSync(tDir, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(storeDir, { recursive: true, force: true });
+  }
+});
+
 test("a file already uploaded is not handed over again on the next settle", async () => {
   // Reported from a production thread: the same files kept arriving, and the
   // counts gave the mechanism away — the oldest file posted 13 times, the next
@@ -691,7 +902,7 @@ test("a file already uploaded is not handed over again on the next settle", asyn
     store.add({ ...fakePairing(), cwd });
     const { notifier } = fakeNotifier();
     const { engine, handovers } = uploadRecordingEngine();
-    const watcher = new BackgroundWatcher(rotatingTerminals(cwd, () => "working"), store, engine, notifier, 20);
+    const watcher = new BackgroundWatcher("herdr", rotatingTerminals(cwd, () => "working"), store, engine, notifier, 20);
 
     // Written only after the watch exists: a transcript that was already there
     // when watching began is deliberately never replayed.
@@ -717,5 +928,63 @@ test("a file already uploaded is not handed over again on the next settle", asyn
     rmSync(dir, { recursive: true, force: true });
     rmSync(cwd, { recursive: true, force: true });
     rmSync(tDir, { recursive: true, force: true });
+  }
+});
+
+test("watcher ownership follows target prefixes despite mismatched persisted tags", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "cctag-watcher-prefix-"));
+  try {
+    const orca = { ...orcaPairing() };
+    delete orca.backend;
+    const herdr: Pairing = {
+      ...fakePairing(),
+      key: "C1:3.1",
+      threadTs: "3.1",
+      paneId: "wH:p2",
+      backend: "orca",
+    };
+    const pairings = [orca, herdr];
+    let removals = 0;
+    const store = {
+      list: () => pairings,
+      remove: () => {
+        removals++;
+        return true;
+      },
+    } as unknown as PairingStore;
+    const { notifier, replies } = fakeNotifier();
+    const configurations: Array<Array<"herdr" | "orca">> = [["orca"], ["herdr"], ["herdr", "orca"]];
+
+    for (const enabled of configurations) {
+      const calls: Record<"herdr" | "orca", string[]> = { herdr: [], orca: [] };
+      const watchers = enabled.map((backend) =>
+        new BackgroundWatcher(
+          backend,
+          fakeTerminals((target) => {
+            calls[backend].push(target);
+            return null;
+          }),
+          store,
+          idleEngine,
+          notifier,
+          5,
+          60_000,
+        ),
+      );
+      try {
+        watchers.forEach((watcher) => watcher.start());
+        await sleep(40);
+      } finally {
+        watchers.forEach((watcher) => watcher.stop());
+      }
+
+      assert.deepEqual([...new Set(calls.herdr)].sort(), enabled.includes("herdr") ? ["wH:p2"] : []);
+      assert.deepEqual([...new Set(calls.orca)].sort(), enabled.includes("orca") ? [ORCA_PANE] : []);
+    }
+
+    assert.equal(removals, 0);
+    assert.deepEqual(replies, []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

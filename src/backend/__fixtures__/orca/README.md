@@ -1,0 +1,11 @@
+# Orca process captures
+
+Captured on 2026-09-28 with Claude Code 2.1.283 and Orca CLI/app 1.4.215.
+
+- `claude-session-transitions.json` retains the original terminal-list, process, and session-file observations before resume, after resuming the same session, and after `/clear`. Its task workspace, branch, and scratch paths are now neutral placeholders; the redaction map covers all placeholder classes used across these fixtures.
+- `worktree-ps-question-state.json` adds one live `orca worktree ps --json` `agents[]` row while AskUserQuestion is waiting, paired with the same terminal's filtered terminal-list entry and targeted process/environment row. The pane join is preserved: `agents[0].paneKey`, terminal `tabId:leafId`, and `ORCA_PANE_KEY` all use `<tab-B>:<leaf-B>`; only `ORCA_PANE_KEY` and `ORCA_TERMINAL_HANDLE` are retained from the process environment.
+- `same-tty-foreground-child-policy.txt` is unchanged. Its same-process contract question remains design-owned.
+
+The one-state sample is intentionally reduced to the selected agent row, one terminal entry (`totalCount: 1` in the reduced fixture), and the matching process row. Resume/clear transitions were not replayed; the existing transition fixture is retained and the missing `worktree ps` join is added separately.
+
+Captured commands: `orca worktree ps --json`; `orca terminal list --worktree path:<worktree-B> --json`; `ps -p <pid> -o pid=,ppid=,pgid=,tpgid=,tty=,lstart=,command=`; and `ps eww -p <pid>` (retaining only the two Orca environment keys). The process sample maps its task-specific title as `<terminal-title>`; screen fixtures map `<prior-session-note>` and `<task-content>` for non-TUI transcript content.

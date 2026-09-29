@@ -1,15 +1,17 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { backendForTarget } from "./backend/target.js";
 
 export interface Pairing {
   key: string; // `${channel}:${threadTs}` for thread pairings, `${channel}` for channel pairings
   channel: string;
   threadTs?: string;
-  // The backend target used for terminal operations. The current Herdr
-  // adapter uses the stable pane id here, so a CLI restart in place preserves
-  // the pairing.
+  // The backend target used for terminal operations. Its `orca:` prefix is
+  // authoritative; an unprefixed target is Herdr.
   paneId: string;
+  /** Optional persistence tag derived from paneId; it is never used to route. */
+  backend?: "orca";
   // Display/debug only, snapshotted at pairing time — never used to address
   // Terminals. A pane's id doesn't change when its CLI restarts, so this can
   // become stale without affecting the pairing.
@@ -41,6 +43,12 @@ export class PairingStore {
   constructor(private readonly path: string = DEFAULT_STORE_PATH) {
     this.load();
   }
+  private static withTargetBackend(pairing: Pairing): Pairing {
+    const normalized = { ...pairing };
+    if (backendForTarget(pairing.paneId) === "orca") normalized.backend = "orca";
+    else delete normalized.backend;
+    return normalized;
+  }
 
   private load(): void {
     let raw: string;
@@ -67,7 +75,13 @@ export class PairingStore {
         );
         continue;
       }
-      this.pairings.set(p.key, p);
+      const storedBackend = p.backend ?? "herdr";
+      const targetBackend = backendForTarget(p.paneId);
+      if (storedBackend !== targetBackend) {
+        console.warn(`[pairing] stored backend ${storedBackend} disagrees with target ${p.paneId}; using ${targetBackend}`);
+      }
+      const normalized = PairingStore.withTargetBackend(p);
+      this.pairings.set(normalized.key, normalized);
     }
   }
 
@@ -112,18 +126,19 @@ export class PairingStore {
   }
 
   add(p: Pairing): void {
-    const previous = this.pairings.get(p.key);
-    this.pairings.set(p.key, p);
+    const normalized = PairingStore.withTargetBackend(p);
+    const previous = this.pairings.get(normalized.key);
+    this.pairings.set(normalized.key, normalized);
     try {
       this.save();
     } catch (err) {
       // Keep in-memory state consistent with what's actually on disk —
       // otherwise a restart would silently revert this "successful" add.
-      if (previous) this.pairings.set(p.key, previous);
-      else this.pairings.delete(p.key);
+      if (previous) this.pairings.set(normalized.key, previous);
+      else this.pairings.delete(normalized.key);
       throw err;
     }
-    this.onChange?.({ action: "add", pairing: p });
+    this.onChange?.({ action: "add", pairing: normalized });
   }
 
   remove(key: string): boolean {

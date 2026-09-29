@@ -9,6 +9,9 @@ export type VerifiedPrompt = {
   readonly fingerprint: string;
   readonly driver: AgentDriver;
   readonly form: "digit-confirms" | "digit-then-enter" | "compound";
+  readonly expectedCursorLabel?: string;
+  readonly expiresAt?: number;
+  readonly expiredUserMessage?: string;
 };
 
 export type VerifiedModelMenuPrompt = VerifiedPrompt & {
@@ -25,8 +28,13 @@ export function createVerifiedPrompt(
   fingerprint: string,
   driver: AgentDriver,
   form: VerifiedPrompt["form"],
+  options: {
+    expectedCursorLabel?: string;
+    expiresAt?: number;
+    expiredUserMessage?: string;
+  } = {},
 ): VerifiedPrompt {
-  return { [verifiedPromptBrand]: true, fingerprint, driver, form };
+  return { [verifiedPromptBrand]: true, fingerprint, driver, form, ...options };
 }
 
 /** Minted only for Codex's parsed `/model` and effort menus. */
