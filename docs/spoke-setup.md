@@ -13,11 +13,10 @@ You can't generate any of these yourself — get them from your Hub operator:
 - `CCTAG_OWNER_USER_ID` — your own Slack user ID; must match the ID the
   token was issued for, or the Hub rejects the connection
 
-For the Herdr backend, install Herdr and register your Claude Code and/or
-Codex CLI instances as Herdr agents first — see [Installing
-Herdr](../README.md#installing-herdr-macos-notes). The optional Orca backend
-can discover Claude Code terminals without Herdr registration, but is
-read-only; use Herdr for Slack commands that send input or answer prompts.
+Your Spoke can use Herdr, Orca, or both: Herdr supports Claude Code and Codex
+CLI; Orca supports Claude Code and `omp`, but does not list Codex. If you use
+Herdr, install it and register your Claude Code and/or Codex CLI instances as
+Herdr agents first — see [Installing Herdr](../README.md#installing-herdr-macos-notes).
 
 ```bash
 git clone https://github.com/TMLlaboratory/cctag.git
@@ -29,12 +28,13 @@ npm run build
 npm run start:spoke   # or dev:spoke while iterating
 ```
 
-`CCTAG_HERDR_BIN` and `CCTAG_ORCA_BIN` select the local CLI paths. The
-default candidates are `/opt/homebrew/bin/herdr` and `/opt/homebrew/bin/orca`;
-unavailable binaries are disabled, and an empty variable disables that
-backend explicitly. At least one backend must be available. Orca currently
-provides Claude Code discovery and screen reads only; interactive Slack
-control requires Herdr.
+`CCTAG_HERDR_BIN` and `CCTAG_ORCA_BIN` select local CLI paths. When unset, the
+defaults are `/opt/homebrew/bin/herdr` and `/opt/homebrew/bin/orca`. A selected
+path that does not exist disables that backend; setting its variable to an
+empty string disables it explicitly. At least one backend must be available.
+Claude Code on Orca has the same cctag features as on Herdr. Orca also supports
+`omp` text turns, output, and status; OMP questions and approvals are reported
+in Slack but must be answered in the terminal. Codex on Orca is not listed.
 
 Running from a binary install instead of this checkout? Put the same
 values at `~/.config/cctag/config.env` (see the config-discovery note under
@@ -65,13 +65,12 @@ For a persistent second instance, add a second launchd
 `LaunchAgent`/systemd unit whose `EnvironmentVariables`/`Environment` sets
 `CCTAG_ENV_FILE` to that second `.env` file.
 
-Both Spokes on one machine still use the same local Herdr daemon and Orca
-runtime, so they can see the same Claude Code/Codex instances. Pairing one
-workspace to a terminal doesn't stop the other workspace's picker from also
-offering it. cctag doesn't guard against this across separate Spoke
-processes (only within one Spoke's own pairings); avoid pairing the same
-terminal from two workspaces at once, or you may get interleaved writes
-through Herdr.
+Both Spokes on one machine use the same local Herdr daemon and Orca runtime, so
+their pickers can show the same supported sessions. Pairing one workspace to a
+terminal does not stop the other workspace's picker from offering it. cctag
+doesn't guard against this across separate Spoke processes (only within one
+Spoke's own pairings); avoid pairing the same terminal from two workspaces at
+once, or writes may be interleaved through Herdr or Orca.
 
 ## Troubleshooting: "invalid token"
 

@@ -11,6 +11,24 @@ would have to keep. Pin an exact version if that matters to you.
 
 ## [Unreleased]
 
+### Added
+
+- One Spoke can now use herdr and Orca at once: Claude Code works on either
+  backend, Codex CLI on herdr, and `omp` on Orca. Orca's shared Codex app server
+  can attribute status to the wrong pane, so its Codex panes are not listed.
+  OMP questions and approvals show “answer in the terminal” with no Slack
+  answer buttons; Slack answers to those prompts and `mode`/`plan`/`model`
+  commands are unavailable.
+  Orca writes revalidate the foreground process identity; `omp` writes also
+  revalidate the transcript. Herdr target IDs and existing pairings keep their
+  format. The Hub is unchanged.
+
+### Changed
+
+- The README and guides distinguish supported Herdr/Orca agent combinations,
+  terminal-only OMP prompt handling, and Claude Code/Codex answers from Slack
+  or the terminal.
+
 ### Fixed
 
 - A question or permission button now answers only the prompt it was posted for,
