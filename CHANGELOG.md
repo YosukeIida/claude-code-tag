@@ -13,6 +13,11 @@ would have to keep. Pin an exact version if that matters to you.
 
 ### Fixed
 
+- A Claude Code local command (such as `/compact`, `/model`, `/effort` or
+  `/copy`) now ends its turn when it prints its output. These commands write no
+  assistant reply, so the transcript read as a turn that started and never
+  ended. herdr's own idle status hid this; a backend that takes the turn's end
+  from the transcript waited until the turn timed out.
 - The Hub's file cap now bounds what it will read, not just what it will accept.
   `CCTAG_MAX_FILE_MB` was compared only after a frame had been received and
   parsed, so an oversized upload was rejected having already cost the memory —

@@ -152,6 +152,8 @@ export function extractToolOutcomes(records: TranscriptRecord[]): ToolOutcome[] 
  *  ones that must NOT count. */
 const TERMINAL_STOP_REASONS = new Set(["end_turn", "stop_sequence", "max_tokens", "refusal"]);
 
+const LOCAL_COMMAND_STDOUT_PREFIX = "<local-command-stdout>";
+
 /**
  * Turn boundaries in a Claude Code transcript.
  *
@@ -177,6 +179,15 @@ const TERMINAL_STOP_REASONS = new Set(["end_turn", "stop_sequence", "max_tokens"
  * too, and treating those as starts would re-arm the tracker on every tool call
  * in the turn.
  *
+ * A local command (`/compact`, `/model`, `/effort`, `/copy`) writes only
+ * string `user` records — a compaction summary, a `<local-command-caveat>`,
+ * the `<command-name>` record — and ends on one whose content starts with
+ * `<local-command-stdout>`, with neither an `end_turn` nor a `turn_duration`
+ * after it (measured on Claude Code 2.1.x across 40 transcripts). That record
+ * is the `completed` boundary; without it the turn would read as started
+ * forever. A prompt-type slash command (a skill) writes no stdout record and
+ * still ends on the assistant's reply.
+ *
  * Sidechain records (subagent transcripts) are skipped: their turns are not the
  * pane's turn, and letting them arm or settle the tracker would report a
  * subagent's completion as the pane's.
@@ -197,7 +208,7 @@ export function extractLifecycle(records: TranscriptRecord[]): TurnLifecycleEven
     if (r.type === "user") {
       const content = r.message?.content;
       if (typeof content === "string") {
-        events.push({ kind: "started" });
+        events.push({ kind: content.startsWith(LOCAL_COMMAND_STDOUT_PREFIX) ? "completed" : "started" });
       } else if (Array.isArray(content)) {
         const isToolResult = (content as ContentBlock[]).some((b) => b?.type === "tool_result");
         if (!isToolResult) events.push({ kind: "started" });

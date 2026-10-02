@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { SettleTracker } from "./settle.js";
 import { extractLifecycle } from "./agents/claude/transcript.js";
 import { extractCodexLifecycle } from "./agents/codex/transcript.js";
@@ -130,6 +131,45 @@ test("one response split across content blocks yields repeated completions, whic
   const t = new SettleTracker();
   t.observe(events);
   assert.equal(t.effectiveStatus("working"), "idle");
+});
+
+// The records /compact (Claude Code 2.1.287) and /model (2.1.285) write: record
+// order and keys are copied from real interactive transcripts (2026-10-02); all
+// text is replaced by placeholders except each string's leading tag and the
+// first words of the stdout, and timestamps are normalized.
+function localCommandFixture(name: string) {
+  return readFileSync(new URL(`./agents/claude/__fixtures__/${name}`, import.meta.url), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+}
+
+test("a local command's stdout record completes the turn it started", () => {
+  for (const name of ["claude-compact.jsonl", "claude-model.jsonl"]) {
+    const events = extractLifecycle(localCommandFixture(name));
+    assert.deepEqual(events.at(-1), { kind: "completed" }, name);
+    assert.ok(events.slice(0, -1).every((e) => e.kind === "started"), `${name}: every earlier string user record is a start`);
+  }
+});
+
+test("a prompt-type slash command still ends only on the assistant's reply", () => {
+  const command = {
+    type: "user",
+    message: { role: "user", content: "<command-message>skill</command-message>\n<command-name>/skill</command-name>" },
+  };
+  assert.deepEqual(extractLifecycle([command]), [{ kind: "started" }]);
+  assert.deepEqual(extractLifecycle([command, assistantWith("end_turn", [{ type: "text", text: "done" }])]), [
+    { kind: "started" },
+    { kind: "completed" },
+  ]);
+});
+
+test("herdr's status after a local command: working settles, blocked is left alone", () => {
+  const t = new SettleTracker();
+  t.observe(extractLifecycle(localCommandFixture("claude-compact.jsonl")));
+  assert.equal(t.effectiveStatus("working"), "idle");
+  assert.equal(t.effectiveStatus("idle"), "idle");
+  assert.equal(t.effectiveStatus("blocked"), "blocked");
 });
 
 test("stop_sequence and max_tokens end a turn as well", () => {
