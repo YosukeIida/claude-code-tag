@@ -53,6 +53,18 @@ export interface ScreenSnapshot {
   complete: boolean;
 }
 
+export interface SubmitComposerState {
+  readonly probe: "x" | "y" | null;
+  readonly stash: "untouched" | "uncertain" | "stashed";
+  readonly submitUncertain: boolean;
+}
+
+export const EMPTY_SUBMIT_COMPOSER_STATE: SubmitComposerState = {
+  probe: null,
+  stash: "untouched",
+  submitUncertain: false,
+};
+
 export interface ListResult {
   agents: AgentInfo[];
   failures: { backend: BackendName; reason: string }[];
@@ -60,13 +72,20 @@ export interface ListResult {
   notices: string[];
 }
 
-export class UnknownTarget extends Error {}
-export class BackendUnavailable extends Error {}
-
 export class SubmitRefused extends Error {
   constructor(
-    readonly reason: "not-idle" | "draft" | "gate" | "incomplete-screen" | "agent-changed" | "cancelled" | "unsafe-text",
+    readonly reason:
+      | "not-idle"
+      | "draft"
+      | "probe-unverified"
+      | "stash-unverified"
+      | "gate"
+      | "incomplete-screen"
+      | "agent-changed"
+      | "cancelled"
+      | "unsafe-text",
     message: string,
+    readonly composer: SubmitComposerState = EMPTY_SUBMIT_COMPOSER_STATE,
   ) {
     super(message);
   }
@@ -81,7 +100,15 @@ export class ExpectationLost extends Error {
   }
 }
 export class WriteOutcomeUnknown extends Error {
-  constructor(cause?: unknown) {
+  constructor(
+    cause?: unknown,
+    readonly composer: SubmitComposerState = EMPTY_SUBMIT_COMPOSER_STATE,
+  ) {
     super(WRITE_OUTCOME_UNKNOWN_MESSAGE, cause === undefined ? undefined : { cause });
   }
 }
+
+
+export class UnknownTarget extends Error {}
+export class BackendUnavailable extends Error {}
+

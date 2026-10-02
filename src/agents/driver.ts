@@ -1,5 +1,5 @@
 import type { BlindPermissionPrompt, VerifiedPrompt } from "../backend/prompt.js";
-import type { AnswerChannel, ComposerChannel, Terminals } from "../backend/index.js";
+import type { AnswerChannel, ComposerChannel, SubmitOutcome, Terminals } from "../backend/index.js";
 import type { AgentInfo, AgentRef, ScreenSnapshot, TranscriptIdentity } from "../backend/types.js";
 import { claudeDriver } from "./claude/driver.js";
 import { codexDriver } from "./codex/driver.js";
@@ -43,6 +43,11 @@ export type BlockedPrompt =
     }
   | { kind: "blind-permission"; blind: BlindPermissionPrompt }
   | { kind: "unreadable-question" };
+
+export interface ModelCommandResult {
+  reply: string;
+  submitOutcome: SubmitOutcome | null;
+}
 /**
  * Files the agent explicitly asked to hand to the user (Claude Code's
  * `SendUserFile`), not yet known to have succeeded.
@@ -185,8 +190,10 @@ export interface AgentDriver {
     expected?: { question: string; answers: readonly string[]; deadlineAt?: number },
   ): VerifiedPrompt | null;
   parseCursorLabel(snap: ScreenSnapshot): string | null;
-  /** Positively identifies this driver's empty composer; unsupported drivers omit it. */
+  /** Drivers that can positively identify the idle composer; Orca fails closed when absent. */
   isIdleComposer?(snap: ScreenSnapshot): boolean;
+  /** Whether this driver can distinguish a Claude prompt suggestion from a typed draft via a one-character probe. */
+  composerProbe?: true;
   /**
    * A startup dialog waiting on a human before any prompt can land, or null.
    * Returns a short description for quoting back to the user.
@@ -282,8 +289,8 @@ export interface AgentDriver {
 
   /** Shift+Tab-style mode ring, or null if this agent has no equivalent. */
   readonly modes: ModeSupport | null;
-  /** Handles `@cctag model <argsText>` end-to-end; returns the Slack reply text to post. */
-  runModelCommand(terminals: Terminals, agent: AgentInfo, argsText: string): Promise<string>;
+  /** Handles `@cctag model <argsText>` end-to-end, including its submit outcome. */
+  runModelCommand(terminals: Terminals, agent: AgentInfo, argsText: string): Promise<ModelCommandResult>;
 }
 
 const DANGER_WORDS_RE = /\b(rm\s+-rf|sudo|--force|DROP\s+TABLE)\b/i;

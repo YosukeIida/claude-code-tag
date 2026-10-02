@@ -1,39 +1,18 @@
 import type { IncomingFile } from "./attachments.js";
-import type { Terminals } from "./backend/index.js";
+import type { BackendName, Terminals } from "./backend/index.js";
 import {
   ExpectationLost,
   SubmitRefused,
-  UNSENDABLE_TEXT_MESSAGE,
-  WRITE_OUTCOME_UNKNOWN_MESSAGE,
   WriteOutcomeUnknown,
-  type BackendName,
 } from "./backend/types.js";
+import { draftStashedText, submitRefusedText, writeOutcomeUnknownText } from "./backend/submit-notice.js";
 import { backendForTarget } from "./backend/target.js";
 import { PairingStore } from "./pairing.js";
 import type { TurnEngine } from "./turn.js";
 import type { Notifier } from "./notifier.js";
 import { agentPickerBlocks } from "./slack/blocks.js";
-import { driverFor, type AgentDriver } from "./agents/driver.js";
+import { driverFor, type AgentDriver, type ModelCommandResult } from "./agents/driver.js";
 import { classifiedStatus } from "./settle.js";
-
-function submitRefusedText(reason: SubmitRefused["reason"], backend: BackendName): string {
-  switch (reason) {
-    case "not-idle":
-      return `⚠️ ${backend} は入力待ちではないため送信しませんでした。ターミナルの状態を確認してください。`;
-    case "draft":
-      return `⚠️ ${backend} の入力欄に未送信の文字があります。送信していません。ターミナルで確認してください。`;
-    case "gate":
-      return `⚠️ ${backend} のダイアログが送信を拒否しました。このダイアログは端末で答えてください。`;
-    case "incomplete-screen":
-      return `⚠️ ${backend} の画面を完全に確認できなかったため、送信しませんでした。`;
-    case "agent-changed":
-      return `⚠️ ${backend} の接続先エージェントが切り替わったため、送信しませんでした。再度送信してください。`;
-    case "cancelled":
-      return `⚠️ ${backend} への送信を中止しました。`;
-    case "unsafe-text":
-      return UNSENDABLE_TEXT_MESSAGE;
-  }
-}
 
 
 function sleep(ms: number): Promise<void> {
@@ -321,8 +300,28 @@ export class CommandHandler {
           await this.notifier.postReply(channel, threadTs, OMP_UNSUPPORTED_MESSAGE);
           return;
         }
-        const reply = await driver.runModelCommand(this.terminals, agent, modelMatch[1].trim());
-        await this.notifier.postReply(channel, threadTs, reply);
+        let result: ModelCommandResult;
+        try {
+          result = await driver.runModelCommand(this.terminals, agent, modelMatch[1].trim());
+        } catch (error) {
+          const backend = backendForTarget(agent.ref.target);
+          if (error instanceof SubmitRefused) {
+            await this.notifier.postReply(
+              channel,
+              threadTs,
+              submitRefusedText(error.reason, backend, error.composer),
+            );
+          } else if (error instanceof WriteOutcomeUnknown) {
+            await this.notifier.postReply(channel, threadTs, writeOutcomeUnknownText(error));
+          } else {
+            throw error;
+          }
+          return;
+        }
+        const stashNotice = result.submitOutcome?.draftStashed
+          ? `\n${draftStashedText(backendForTarget(agent.ref.target))}`
+          : "";
+        await this.notifier.postReply(channel, threadTs, `${result.reply}${stashNotice}`);
       } finally {
         lease.release();
       }
@@ -547,11 +546,15 @@ export class CommandHandler {
         return;
       }
       if (err instanceof SubmitRefused) {
-        await this.notifier.postReply(channel, threadTs, submitRefusedText(err.reason, backendForTarget(pairing.paneId)));
+        await this.notifier.postReply(
+          channel,
+          threadTs,
+          submitRefusedText(err.reason, backendForTarget(pairing.paneId), err.composer),
+        );
         return;
       }
       if (err instanceof WriteOutcomeUnknown) {
-        await this.notifier.postReply(channel, threadTs, WRITE_OUTCOME_UNKNOWN_MESSAGE);
+        await this.notifier.postReply(channel, threadTs, writeOutcomeUnknownText(err));
         return;
       }
       await this.notifier.postReply(channel, threadTs, `❌ エラー: ${err instanceof Error ? err.message : String(err)}`);

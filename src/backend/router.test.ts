@@ -38,7 +38,7 @@ function herdr(overrides: Partial<Terminals> = {}): Terminals {
       return { text: "", draft: null, complete: true };
     },
     async submit() {
-      return "accepted";
+      return { status: "accepted", draftStashed: false };
     },
     openAnswer() {
       return {
@@ -151,7 +151,7 @@ test("orca targets fail closed before reaching the Herdr backend", async () => {
       },
       async submit(ref: AgentRef, _text: string, _ctx: SubmitContext) {
         calls.push(`submit:${ref.target}`);
-        return "accepted";
+        return { status: "accepted", draftStashed: false };
       },
     }),
     orca: null,

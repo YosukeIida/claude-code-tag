@@ -5,7 +5,10 @@ import { backendForTarget } from "./target.js";
 
 export * from "./types.js";
 
-export type SubmitOutcome = "started" | "accepted";
+export interface SubmitOutcome {
+  status: "started" | "accepted";
+  draftStashed: boolean;
+}
 
 export interface SubmitContext {
   driver: AgentDriver;

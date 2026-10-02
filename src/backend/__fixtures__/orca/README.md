@@ -9,3 +9,18 @@ Captured on 2026-09-28 with Claude Code 2.1.283 and Orca CLI/app 1.4.215.
 The one-state sample is intentionally reduced to the selected agent row, one terminal entry (`totalCount: 1` in the reduced fixture), and the matching process row. Resume/clear transitions were not replayed; the existing transition fixture is retained and the missing `worktree ps` join is added separately.
 
 Captured commands: `orca worktree ps --json`; `orca terminal list --worktree path:<worktree-B> --json`; `ps -p <pid> -o pid=,ppid=,pgid=,tpgid=,tty=,lstart=,command=`; and `ps eww -p <pid>` (retaining only the two Orca environment keys). The process sample maps its task-specific title as `<terminal-title>`; screen fixtures map `<prior-session-note>` and `<task-content>` for non-TUI transcript content.
+
+## Claude composer probe captures
+
+Captured on 2026-10-02 with Claude Code 2.1.287 and Orca CLI/app 1.4.216. Each file preserves the complete raw `orca terminal read --screen --json` envelope and every screen row; request IDs, terminal handles, and runtime IDs are redacted, as are Stop-hook lines about dotfiles.
+
+- `p4-00-draft.json` — typed draft before the probe (`capture/V9/p4-00-draft.json`).
+- `p4-01-draft-plus-x.json` — typed draft with the probe appended (`capture/V9/p4-01-draft-plus-x.json`).
+- `p4-02-draft-after-bs.json` — typed draft after Backspace (`capture/V9/p4-02-draft-after-bs.json`).
+- `p4-10-suggestion.json` — prompt suggestion before the probe (`capture/V9/p4-10-suggestion.json`).
+- `p4-11-suggestion-plus-x.json` — suggestion replaced by the probe (`capture/V9/p4-11-suggestion-plus-x.json`).
+- `p4-12-suggestion-after-bs.json` — prompt suggestion restored by Backspace (`capture/V9/p4-12-suggestion-after-bs.json`).
+- `p3-10-stashed.json` — empty composer with the exact `❯ Try "…"` placeholder (`capture/V9/p3-10-stashed.json`).
+- `p3-11-right-after-submit.json` — observed post-submit draft restoration (`capture/V9/p3-11-right-after-submit.json`).
+- `probe-A-fresh.json` — fresh-session composer with the `❯ Try "…"` placeholder (`capture/V9/probe-A-fresh.json`).
+- `probe-C-typed.json` — typed draft reported separately from the visible `❯` row (`capture/V9/probe-C-typed.json`).

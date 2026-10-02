@@ -4,6 +4,7 @@ import type { AgentInfo, ScreenSnapshot } from "../../backend/types.js";
 import type {
   AgentDriver,
   BlockedPrompt,
+  ModelCommandResult,
   OrcaProcessAccess,
   OrcaProcessIdentity,
   OrcaProcessSession,
@@ -361,7 +362,7 @@ export const ompDriver: AgentDriver = {
 
   modes: null,
 
-  async runModelCommand(_terminals: Terminals, _agent: AgentInfo, _argsText: string): Promise<string> {
-    return "omp では使えません";
+  async runModelCommand(_terminals: Terminals, _agent: AgentInfo, _argsText: string): Promise<ModelCommandResult> {
+    return { reply: "omp では使えません", submitOutcome: null };
   },
 };

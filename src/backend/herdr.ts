@@ -244,7 +244,7 @@ export class HerdrBackend implements Terminals {
       if (status !== "idle" && status !== "done") break;
       await this.writeKeys(ref.target, "Enter");
     }
-    return "accepted";
+    return { status: "accepted", draftStashed: false };
   }
 
   private async writeText(target: string, text: string): Promise<void> {

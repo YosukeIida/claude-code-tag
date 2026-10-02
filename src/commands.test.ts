@@ -644,11 +644,13 @@ test("SubmitRefused reasons and unknown write outcomes reach Slack with safe ins
   const cases = [
     ["not-idle", "⚠️ orca は入力待ちではないため送信しませんでした。ターミナルの状態を確認してください。"],
     ["draft", "⚠️ orca の入力欄に未送信の文字があります。送信していません。ターミナルで確認してください。"],
+    ["probe-unverified", "⚠️ orca の入力欄が提案か書きかけかを確かめられなかったため、送信していません。 端末で確かめてください。"],
+    ["stash-unverified", "⚠️ orca の入力欄の書きかけを Ctrl+S で退避しようとしましたが、送れる状態か確かめられなかったため、送信していません。 端末で確かめてください。"],
     ["gate", "⚠️ orca のダイアログが送信を拒否しました。このダイアログは端末で答えてください。"],
-    ["incomplete-screen", "⚠️ orca の画面を完全に確認できなかったため、送信しませんでした。"],
-    ["agent-changed", "⚠️ orca の接続先エージェントが切り替わったため、送信しませんでした。再度送信してください。"],
-    ["cancelled", "⚠️ orca への送信を中止しました。"],
-    ["unsafe-text", UNSENDABLE_TEXT_MESSAGE],
+    ["incomplete-screen", "⚠️ orca の画面を完全に確認できなかったため、送信しませんでした。 端末で確かめてください。"],
+    ["agent-changed", "⚠️ orca の接続先エージェントが切り替わったため、送信しませんでした。再度送信してください。 端末で確かめてください。"],
+    ["cancelled", "⚠️ orca への送信を中止しました。 端末で確かめてください。"],
+    ["unsafe-text", `${UNSENDABLE_TEXT_MESSAGE} 端末で確かめてください。`],
   ] as const;
   const replies: string[] = [];
   const notifier = {
@@ -700,7 +702,61 @@ test("SubmitRefused reasons and unknown write outcomes reach Slack with safe ins
     text: "send this",
     ts: "1.3",
   });
-  assert.deepEqual(replies, [WRITE_OUTCOME_UNKNOWN_MESSAGE]);
+  assert.deepEqual(replies.splice(0), [WRITE_OUTCOME_UNKNOWN_MESSAGE]);
+
+  const stashedGateEngine = {
+    isBusy: () => false,
+    async startTurn() {
+      throw new SubmitRefused("gate", "internal refusal", {
+        probe: null,
+        stash: "stashed",
+        submitUncertain: false,
+      });
+    },
+  } as unknown as TurnEngine;
+  await new CommandHandler(
+    NO_TERMINALS,
+    { get: () => pairing } as unknown as PairingStore,
+    stashedGateEngine,
+    notifier,
+    OWNER,
+  ).handleMention({
+    channel: "C1",
+    threadTs: "1.1",
+    userId: OWNER,
+    text: "send this",
+    ts: "1.4",
+  });
+  assert.deepEqual(replies.splice(0), [
+    "⚠️ orca のダイアログが送信を拒否しました。このダイアログは端末で答えてください。 送信の前に、入力欄の書きかけを Ctrl+S で退避しました。入力欄が空（打った文字も灰色の提案も無い）のときに Ctrl+S を押すと戻ります。文字があるときに押すと、退避した書きかけは消えます。",
+  ]);
+
+  const uncertainEngine = {
+    isBusy: () => false,
+    async startTurn() {
+      throw new WriteOutcomeUnknown(undefined, {
+        probe: "y",
+        stash: "uncertain",
+        submitUncertain: false,
+      });
+    },
+  } as unknown as TurnEngine;
+  await new CommandHandler(
+    NO_TERMINALS,
+    { get: () => pairing } as unknown as PairingStore,
+    uncertainEngine,
+    notifier,
+    OWNER,
+  ).handleMention({
+    channel: "C1",
+    threadTs: "1.1",
+    userId: OWNER,
+    text: "send this",
+    ts: "1.5",
+  });
+  assert.deepEqual(replies, [
+    "送信できたか確認できません。端末を確かめてください 確かめのために打った `y` が入力欄に1文字残っているかもしれません。 書きかけが Ctrl+S で退避されたかどうかを確かめられませんでした。端末で入力欄を見てください。入力欄に文字があるときに Ctrl+S を押すと、その文字が退避され、前に退避したものは消えます。",
+  ]);
 });
 
 test("an Orca message-path miss keeps the pairing for watcher grace", async () => {
@@ -916,7 +972,7 @@ test("OMP mode plan and model commands use the exact unsupported reply without t
     },
     async submit() {
       writes++;
-      return "accepted";
+      return { status: "accepted", draftStashed: false };
     },
     openComposer() {
       writes++;
@@ -951,6 +1007,124 @@ test("OMP mode plan and model commands use the exact unsupported reply without t
   assert.equal(writes, 0);
   assert.equal(releases, 1, "the model lease is released after its read-only OMP refusal");
 });
+
+test("/model reports when Claude stashed the composer draft", async () => {
+  const target = "orca:tab-7:leaf-2";
+  const pairing: Pairing = { ...BUTTON_PAIRING, paneId: target, backend: "orca" };
+  const agent: AgentInfo = {
+    ...ompAgentForCommands(target),
+    agent: "claude",
+    sessionId: null,
+    ref: { target, pid: 42, processStartedAt: 1 },
+    evidence: { kind: "classified", status: "idle" },
+  };
+  const replies: string[] = [];
+  const submitted: string[] = [];
+  const terminals = {
+    async get() {
+      return agent;
+    },
+    async read() {
+      return { text: "", draft: null, complete: true };
+    },
+    async submit(_ref: unknown, text: string) {
+      submitted.push(text);
+      return { status: "accepted", draftStashed: true };
+    },
+  } as unknown as Terminals;
+  const engine = {
+    isBusy: () => false,
+    acquire() {
+      return { cancelled: false, release() {}, signal: new AbortController().signal };
+    },
+  } as unknown as TurnEngine;
+  const notifier = {
+    async postReply(_channel: string, _threadTs: string, text: string) {
+      replies.push(text);
+    },
+  } as unknown as Notifier;
+
+  await new CommandHandler(
+    terminals,
+    { get: () => pairing } as unknown as PairingStore,
+    engine,
+    notifier,
+    OWNER,
+  ).handleMention({ channel: "C1", threadTs: "1.1", userId: OWNER, text: "model sonnet", ts: "1.2" });
+
+  assert.deepEqual(submitted, ["/model sonnet"]);
+  assert.equal(replies.length, 1);
+  assert.ok(replies[0].endsWith(
+    "\n📥 orca の入力欄の書きかけを一時退避して送りました。Claude Code 2.1.287 では送信の後に入力欄へ戻ります。戻っていなければ、入力欄が空（打った文字も灰色の提案も無い）のときに Ctrl+S を押すと戻ります。",
+  ));
+});
+test("/model posts state-aware submit failures with the composer state", async () => {
+  const target = "orca:tab-7:leaf-2";
+  const pairing: Pairing = { ...BUTTON_PAIRING, paneId: target, backend: "orca" };
+  const agent: AgentInfo = {
+    ...ompAgentForCommands(target),
+    agent: "claude",
+    sessionId: null,
+    ref: { target, pid: 42, processStartedAt: 1 },
+    evidence: { kind: "classified", status: "idle" },
+  };
+  const stashed = { probe: null, stash: "stashed", submitUncertain: false } as const;
+  const scenarios = [
+    {
+      name: "refusal after a confirmed stash",
+      error: new SubmitRefused("stash-unverified", "internal refusal", stashed),
+      expected:
+        "⚠️ orca の入力欄の書きかけを Ctrl+S で退避しようとしましたが、送れる状態か確かめられなかったため、送信していません。 送信の前に、入力欄の書きかけを Ctrl+S で退避しました。入力欄が空（打った文字も灰色の提案も無い）のときに Ctrl+S を押すと戻ります。文字があるときに押すと、退避した書きかけは消えます。 端末で確かめてください。",
+    },
+    {
+      name: "unknown final write after a confirmed stash",
+      error: new WriteOutcomeUnknown(new Error("transport failed"), { ...stashed, submitUncertain: true }),
+      expected:
+        "送信できたか確認できません。端末を確かめてください 送信の前に、入力欄の書きかけを Ctrl+S で退避しました。送信されていれば、Claude Code が入力欄に戻していることがあります（2.1.287）。まず端末で入力欄を見て、書きかけが戻っておらず入力欄が空（打った文字も灰色の提案も無い）のときだけ Ctrl+S を押してください。",
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const replies: string[] = [];
+    let releases = 0;
+    const terminals = {
+      async get() {
+        return agent;
+      },
+      async submit() {
+        throw scenario.error;
+      },
+    } as unknown as Terminals;
+    const engine = {
+      acquire() {
+        return { cancelled: false, release() { releases++; }, signal: new AbortController().signal };
+      },
+    } as unknown as TurnEngine;
+    const notifier = {
+      async postReply(_channel: string, _threadTs: string, text: string) {
+        replies.push(text);
+      },
+    } as unknown as Notifier;
+
+    await new CommandHandler(
+      terminals,
+      { get: () => pairing } as unknown as PairingStore,
+      engine,
+      notifier,
+      OWNER,
+    ).handleMention({
+      channel: "C1",
+      threadTs: "1.1",
+      userId: OWNER,
+      text: "model sonnet",
+      ts: "1.2",
+    });
+
+    assert.deepEqual(replies, [scenario.expected], scenario.name);
+    assert.equal(releases, 1, scenario.name);
+  }
+});
+
 
 test("OMP and stale Claude buttons refuse before invoking any answer channel", async () => {
   const target = "orca:tab-7:leaf-2";

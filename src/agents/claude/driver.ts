@@ -1,7 +1,7 @@
 import { basename, join } from "node:path";
 
 import { promptFingerprint } from "../fingerprint.js";
-import type { AgentDriver, AskUserQuestionPaneInfo, BlockedPrompt } from "../driver.js";
+import type { AgentDriver, AskUserQuestionPaneInfo, BlockedPrompt, ModelCommandResult } from "../driver.js";
 import type { AnswerChannel, Terminals } from "../../backend/index.js";
 import { createBlindPermissionPrompt, createVerifiedPrompt } from "../../backend/prompt.js";
 import {
@@ -87,9 +87,11 @@ function answerListsMatch(
   );
 }
 
-function composerFooterStart(rows: readonly string[]): number | null {
+function composerFooterStart(rows: readonly string[], acceptTryPlaceholder = false): number | null {
   for (let i = 1; i < rows.length - 1; i++) {
-    if (rows[i]!.trim() !== "❯") continue;
+    const inputRow = rows[i]!.trim();
+    const isTryPlaceholder = acceptTryPlaceholder && /^❯\s+Try ".+"$/u.test(inputRow);
+    if (inputRow !== "❯" && !isTryPlaceholder) continue;
     if (!/^[─━]+$/u.test(rows[i - 1]!.trim()) || !/^[─━]+$/u.test(rows[i + 1]!.trim())) continue;
     if (rows.slice(i + 2).some((row) => row.trim())) return i - 1;
   }
@@ -247,11 +249,11 @@ async function runClaudeSlashCommand(
   driver: AgentDriver,
   agent: AgentInfo,
   command: string,
-): Promise<string> {
+): Promise<ModelCommandResult> {
   // Atomic submit — same reason as TurnEngine.startTurn: a separate
   // send-text + Enter races Claude Code's paste coalescing and can leave the
   // command unsent. Terminals.submit keeps it one server-side operation.
-  await terminals.submit(agent.ref, command, {
+  const submitOutcome = await terminals.submit(agent.ref, command, {
     driver,
     cancelled: () => false,
     transcriptGrew: () => false,
@@ -289,7 +291,7 @@ async function runClaudeSlashCommand(
 
   const raw = (await terminals.read(agent.ref.target, 40, "history")).text;
   const snippet = stripFooterChrome(raw);
-  return "```\n" + snippet.slice(-1500) + "\n```";
+  return { reply: "```\n" + snippet.slice(-1500) + "\n```", submitOutcome };
 }
 
 export const claudeDriver: AgentDriver = {
@@ -415,12 +417,13 @@ export const claudeDriver: AgentDriver = {
   parseCursorLabel(snap) {
     return snap.complete ? parseClaudeCursorLabel(snap.text) : null;
   },
+  composerProbe: true,
   isIdleComposer(snap) {
     if (!snap.complete) return false;
     const rows = snap.text.split(/\r?\n/);
     if (rows.some((row) => /^✳\s+\S/u.test(row.trimStart()))) return false;
 
-    return composerFooterStart(rows) !== null;
+    return composerFooterStart(rows, snap.draft === null) !== null;
   },
 
   async answerOption(channel, value, _expectedLabel) {

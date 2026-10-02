@@ -208,7 +208,7 @@ function fakeHerdr(
       return { text: await readPane(), draft: null, complete: true };
     },
     async submit() {
-      return "accepted";
+      return { status: "accepted", draftStashed: false };
     },
     openAnswer() {
       return channel;
@@ -899,6 +899,42 @@ function capturedScreen(filename: string): ScreenSnapshot {
       terminal.limited === false,
   };
 }
+
+function capturedOrcaProbeScreen(filename: string): ScreenSnapshot {
+  const capture = JSON.parse(
+    readFileSync(new URL(`../../backend/__fixtures__/orca/${filename}`, import.meta.url), "utf8"),
+  ) as ScreenCapture;
+  const terminal = capture.result?.terminal ?? capture.terminal ?? {};
+  const rawTail = terminal.tail;
+  const tail = Array.isArray(rawTail) ? rawTail : [];
+  const lines = tail.filter((line): line is string => typeof line === "string");
+  return {
+    text: lines.join("\n"),
+    draft: typeof terminal.draft === "string" ? terminal.draft : null,
+    complete:
+      Array.isArray(rawTail) &&
+      lines.length === tail.length &&
+      terminal.source === "screen" &&
+      terminal.status === "running" &&
+      terminal.truncated === false &&
+      terminal.limited === false,
+  };
+}
+
+test("fresh probe's Try placeholder is idle only with an empty draft", () => {
+  const screen = capturedOrcaProbeScreen("probe-A-fresh.json");
+  assert.equal(screen.draft, null);
+  assert.equal(isIdleComposer(screen), true);
+  assert.equal(isIdleComposer({ ...screen, draft: "retained draft" }), false);
+  assert.equal(isIdleComposer({ ...screen, draft: "" }), false);
+});
+
+test("typed idle composer and restored Ctrl+S prompt remain eligible for probing", () => {
+  const typed = capturedOrcaProbeScreen("probe-C-typed.json");
+  assert.equal(typed.draft, "typed draft probe");
+  assert.equal(isIdleComposer(typed), true);
+  assert.equal(isIdleComposer(capturedOrcaProbeScreen("p3-10-stashed.json")), true);
+});
 
 function isIdleComposer(snapshot: ScreenSnapshot): boolean {
   return claudeDriver.isIdleComposer?.(snapshot) === true;

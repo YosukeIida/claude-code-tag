@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { setTimeout as delay } from "node:timers/promises";
 import { homedir } from "node:os";
 import { open, readFile } from "node:fs/promises";
 import { promisify } from "node:util";
@@ -16,12 +17,14 @@ import type {
 import type { BlindPermissionPrompt, VerifiedModelMenuPrompt, VerifiedPrompt } from "./prompt.js";
 import {
   BackendUnavailable,
+  EMPTY_SUBMIT_COMPOSER_STATE,
   ExpectationLost,
   hasUnsendableC0Controls,
   type AgentInfo,
   type AgentRef,
   type ListResult,
   type ScreenSnapshot,
+  type SubmitComposerState,
   type TranscriptIdentity,
   SubmitRefused,
   UnknownTarget,
@@ -33,6 +36,14 @@ import { backendForTarget } from "./target.js";
 const execFileAsync = promisify(execFile);
 const ORCA_TIMEOUT_MS = 5_000;
 const SUBMIT_TIMEOUT_MS = 25_000;
+const PROBE_POLL_MS = 150;
+const PROBE_TIMEOUT_MS = 3_000;
+type StableComposerRead = { draft: string | null; snapshot: ScreenSnapshot };
+
+function normalizedDraft(draft: string | null): string | null {
+  return draft === "" ? null : draft;
+}
+
 const PS_ARGS = ["-axww", "-o", "pid=,ppid=,pgid=,tpgid=,tty=,lstart=,command="];
 const STALE_HANDLE = "terminal_handle_stale";
 
@@ -821,25 +832,184 @@ export class OrcaBackend implements Terminals {
   }
 
   async submit(ref: AgentRef, text: string, ctx: SubmitContext): Promise<SubmitOutcome> {
-    if (hasUnsendableC0Controls(text)) {
-      throw new SubmitRefused("unsafe-text", UNSENDABLE_TEXT_MESSAGE);
-    }
+    let composer: SubmitComposerState = { ...EMPTY_SUBMIT_COMPOSER_STATE };
+    const refuse = (reason: SubmitRefused["reason"], message: string) => new SubmitRefused(reason, message, composer);
     const checkCancelled = () => {
-      if (ctx.cancelled()) throw new SubmitRefused("cancelled", "Submission was cancelled.");
+      if (ctx.cancelled()) throw refuse("cancelled", "Submission was cancelled.");
     };
+    if (hasUnsendableC0Controls(text)) {
+      throw refuse("unsafe-text", UNSENDABLE_TEXT_MESSAGE);
+    }
     checkCancelled();
     const handle = await this.writableHandle(ref);
     checkCancelled();
-    const snap = await this.readHandle(ref.target, handle);
+    const initial = await this.readHandle(ref.target, handle);
     checkCancelled();
-    if (!snap.complete) throw new SubmitRefused("incomplete-screen", "The terminal screen is incomplete.");
-    if (!ctx.driver.isIdleComposer?.(snap)) {
-      throw new SubmitRefused("not-idle", "The agent is not waiting at an empty composer.");
+    if (!initial.complete) throw refuse("incomplete-screen", "The terminal screen is incomplete.");
+    const initialDraft = normalizedDraft(initial.draft);
+    if (initialDraft !== null && !ctx.driver.composerProbe) {
+      throw refuse("draft", "The composer contains an unsent draft.");
     }
-    // Orca omits draft when it is empty; the driver's positive idle-composer
-    // parse also verifies that the visible composer row is blank.
-    if (snap.draft !== null && snap.draft !== "") {
-      throw new SubmitRefused("draft", "The composer contains an unsent draft.");
+    if (!ctx.driver.isIdleComposer?.(initial)) {
+      throw refuse("not-idle", "The agent is not waiting at an empty composer.");
+    }
+
+    let finalSnapshot = initial;
+    if (initialDraft !== null) {
+
+      const readStableDraft = async (
+        isPositive: (draft: string | null) => boolean,
+      ): Promise<StableComposerRead | null> => {
+        const deadline = Date.now() + PROBE_TIMEOUT_MS;
+        let previousDraft: string | null | undefined;
+        while (true) {
+          checkCancelled();
+          const snapshot = await this.readHandle(ref.target, handle);
+          checkCancelled();
+          const draft = normalizedDraft(snapshot.draft);
+          if (snapshot.complete && ctx.driver.isIdleComposer?.(snapshot) === true && isPositive(draft)) {
+            if (previousDraft !== undefined && previousDraft === draft) return { draft, snapshot };
+            previousDraft = draft;
+          } else {
+            previousDraft = undefined;
+          }
+
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) return null;
+          await delay(Math.min(PROBE_POLL_MS, remaining));
+        }
+      };
+
+      const writeKey = async (
+        key: string,
+        expectedDraft: string,
+        guard: {
+          notIdleReason: SubmitRefused["reason"];
+          draftMismatchReason: SubmitRefused["reason"];
+          beforeWrite?: () => void;
+          onGate?: () => void;
+        },
+      ): Promise<void> => {
+        checkCancelled();
+        const snapshot = await this.readHandle(ref.target, handle);
+        checkCancelled();
+        if (!snapshot.complete) throw refuse("incomplete-screen", "The terminal screen is incomplete before a probe write.");
+        if (ctx.driver.isIdleComposer?.(snapshot) !== true) {
+          throw refuse(guard.notIdleReason, "The composer is not idle before a probe write.");
+        }
+        if (normalizedDraft(snapshot.draft) !== expectedDraft) {
+          throw refuse(guard.draftMismatchReason, "The composer draft changed before a probe write.");
+        }
+
+        let processIsCurrent = false;
+        try {
+          processIsCurrent = await this.sameProcess(ref);
+        } catch {
+          // An unreadable process identity is not permission to write.
+        }
+        if (!processIsCurrent) throw refuse("agent-changed", "The agent process changed before a probe write.");
+        checkCancelled();
+        guard.beforeWrite?.();
+        try {
+          await this.sendRaw(handle, ["--text", key]);
+        } catch (error) {
+          if (error instanceof OrcaCliError && error.code === "agent_prompt_blocked") {
+            guard.onGate?.();
+            throw refuse("gate", "Orca refused the probe write because an agent prompt is blocking.");
+          }
+          throw new WriteOutcomeUnknown(error, composer);
+        }
+      };
+
+      const probeDraft = async (
+        draft: string,
+        failureReason: "probe-unverified" | "stash-unverified",
+        firstWriteReasons: {
+          notIdleReason: SubmitRefused["reason"];
+          draftMismatchReason: SubmitRefused["reason"];
+        } = { notIdleReason: failureReason, draftMismatchReason: failureReason },
+      ): Promise<{ kind: "suggestion" | "typed"; snapshot: ScreenSnapshot }> => {
+        const probe = draft === "x" ? "y" : "x";
+        await writeKey(probe, draft, {
+          ...firstWriteReasons,
+          beforeWrite: () => {
+            composer = { ...composer, probe };
+          },
+          onGate: () => {
+            composer = { ...composer, probe: null };
+          },
+        });
+
+        const observed = await readStableDraft((value) => value === probe || value === `${draft}${probe}`);
+        if (!observed) {
+          throw refuse(failureReason, "The one-character composer probe could not be verified.");
+        }
+
+        if (observed.draft === probe) {
+          await writeKey("\u007f", probe, {
+            notIdleReason: failureReason,
+            draftMismatchReason: failureReason,
+          });
+          const restored = await readStableDraft((value) => value === draft || value === null);
+          if (!restored) {
+            throw refuse(failureReason, "The suggestion did not return after removing the probe.");
+          }
+          composer = { ...composer, probe: null };
+          return { kind: "suggestion", snapshot: restored.snapshot };
+        }
+
+        await writeKey("\u007f", `${draft}${probe}`, {
+          notIdleReason: failureReason,
+          draftMismatchReason: failureReason,
+        });
+        const restored = await readStableDraft((value) => value === draft);
+        if (!restored) {
+          throw refuse(failureReason, "The typed draft did not return after removing the probe.");
+        }
+        composer = { ...composer, probe: null };
+        return { kind: "typed", snapshot: restored.snapshot };
+      };
+
+      const initialProbe = await probeDraft(initialDraft, "probe-unverified", {
+        notIdleReason: "not-idle",
+        draftMismatchReason: "draft",
+      });
+      if (initialProbe.kind === "suggestion") {
+        finalSnapshot = initialProbe.snapshot;
+      } else {
+        await writeKey("\u0013", initialDraft, {
+          notIdleReason: "probe-unverified",
+          draftMismatchReason: "probe-unverified",
+          beforeWrite: () => {
+            composer = { ...composer, stash: "uncertain" };
+          },
+          onGate: () => {
+            composer = { ...composer, stash: "untouched" };
+          },
+        });
+
+        const afterStash = await readStableDraft((value) => value !== initialDraft);
+        if (!afterStash) {
+          throw refuse("stash-unverified", "The draft was not verified out of the composer after Ctrl+S.");
+        }
+        composer = { ...composer, stash: "stashed" };
+        if (afterStash.draft === null) {
+          finalSnapshot = afterStash.snapshot;
+        } else {
+          const secondProbe = await probeDraft(afterStash.draft, "stash-unverified");
+          if (secondProbe.kind === "typed") {
+            throw refuse("stash-unverified", "A typed draft appeared after the original draft was stashed.");
+          }
+          finalSnapshot = secondProbe.snapshot;
+        }
+      }
+    }
+    if (!finalSnapshot.complete) throw refuse("incomplete-screen", "The final composer screen is incomplete.");
+    if (!ctx.driver.isIdleComposer?.(finalSnapshot)) {
+      throw refuse(
+        composer.stash === "stashed" ? "stash-unverified" : "probe-unverified",
+        "The final composer state is no longer idle.",
+      );
     }
 
     checkCancelled();
@@ -850,23 +1020,28 @@ export class OrcaBackend implements Terminals {
       // An unreadable process identity is not permission to write.
     }
     if (!processIsCurrent) {
-      throw new SubmitRefused("agent-changed", "The agent process changed before submit.");
+      throw refuse("agent-changed", "The agent process changed before submit.");
     }
     // sameProcess is the last asynchronous check; this synchronous guard
     // catches cancellation raised while that process identity was inspected.
     checkCancelled();
 
+    composer = { ...composer, submitUncertain: true };
     let receipt: JsonObject;
     try {
       receipt = await this.sendRaw(handle, ["--text", text, "--enter", "--wait-submit", "15"], SUBMIT_TIMEOUT_MS);
     } catch (error) {
       if (error instanceof OrcaCliError && error.code === "agent_prompt_blocked") {
-        throw new SubmitRefused("gate", "Orca refused the submit because an agent prompt is blocking.");
+        composer = { ...composer, submitUncertain: false };
+        throw refuse("gate", "Orca refused the submit because an agent prompt is blocking.");
       }
-      throw error;
+      throw new WriteOutcomeUnknown(error, composer);
     }
     const stages = object(object(receipt.send)?.prompt)?.stages;
-    return Array.isArray(stages) && stages.includes("turn_started") ? "started" : "accepted";
+    return {
+      status: Array.isArray(stages) && stages.includes("turn_started") ? "started" : "accepted",
+      draftStashed: composer.stash === "stashed",
+    };
   }
 
   private refuseOmpInput(ref: AgentRef, driverKind?: string): void {

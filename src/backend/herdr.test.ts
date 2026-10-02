@@ -190,7 +190,7 @@ test("submit retries only while the agent remains idle or done", async () => {
   try {
     const backend = new HerdrBackend(cli.bin);
     const outcome = await backend.submit(REF, "hello", submitContext(6));
-    assert.equal(outcome, "accepted");
+    assert.deepEqual(outcome, { status: "accepted", draftStashed: false });
     assert.deepEqual(cli.calls(), [
       ["agent", "prompt", "wT:p1", "hello"],
       ["agent", "get", "wT:p1"],

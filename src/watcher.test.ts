@@ -97,7 +97,7 @@ function fakeTerminals(
       return { text: "", draft: null, complete: true };
     },
     async submit() {
-      return "accepted";
+      return { status: "accepted", draftStashed: false };
     },
     openAnswer() {
       return {

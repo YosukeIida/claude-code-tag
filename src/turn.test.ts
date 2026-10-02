@@ -200,7 +200,7 @@ function fakeBackend(
       return { text: pane(), draft: null, complete: true };
     },
     async submit() {
-      return "accepted";
+      return { status: "accepted", draftStashed: false };
     },
     openAnswer() {
       return fakeAnswerChannel();
@@ -283,6 +283,71 @@ function writeClaudeTurn(path: string, startedAt: string, text: string, append =
   else writeFileSync(path, data);
 }
 
+test("a stashed Orca draft is reported in the thread after submission", async () => {
+  const target = `orca:${PANE}`;
+  const pairing: Pairing = { ...fakePairing(), paneId: target, backend: "orca" };
+  const { notifier, posts } = fakeNotifier();
+  const terminals = fakeBackend(
+    () => "working",
+    () => "",
+    {
+      async get(receivedTarget) {
+        return {
+          ...fakeAgent("working", "orca"),
+          ref: { target: receivedTarget, pid: 42, processStartedAt: 1 },
+        };
+      },
+      async submit() {
+        return { status: "accepted", draftStashed: true };
+      },
+    },
+    "orca",
+  );
+  const engine = engineFor(terminals, notifier, 600_000);
+
+  try {
+    await engine.startTurn(pairing, "U1", "send this");
+    assert.ok(posts.includes(
+      "📥 orca の入力欄の書きかけを一時退避して送りました。Claude Code 2.1.287 では送信の後に入力欄へ戻ります。戻っていなければ、入力欄が空（打った文字も灰色の提案も無い）のときに Ctrl+S を押すと戻ります。",
+    ));
+  } finally {
+    engine.abortAll();
+  }
+});
+
+test("turn refusal forwards probe and stash uncertainty into its status message", async () => {
+  const target = `orca:${PANE}`;
+  const pairing: Pairing = { ...fakePairing(), paneId: target, backend: "orca" };
+  const { notifier, updates } = fakeNotifier();
+  const composer = { probe: "x", stash: "uncertain", submitUncertain: false } as const;
+  const terminals = fakeBackend(
+    () => "working",
+    () => "",
+    {
+      async get(receivedTarget) {
+        return {
+          ...fakeAgent("working", "orca"),
+          ref: { target: receivedTarget, pid: 42, processStartedAt: 1 },
+        };
+      },
+      async submit() {
+        throw new SubmitRefused("stash-unverified", "internal refusal", composer);
+      },
+    },
+    "orca",
+  );
+  const engine = engineFor(terminals, notifier, 600_000);
+
+  try {
+    await assert.rejects(engine.startTurn(pairing, "U1", "send this"), SubmitRefused);
+    assert.deepEqual(updates.map(({ text }) => text), [
+      "⚠️ orca の入力欄の書きかけを Ctrl+S で退避しようとしましたが、送れる状態か確かめられなかったため、送信していません。 確かめのために打った `x` が入力欄に1文字残っているかもしれません。 書きかけが Ctrl+S で退避されたかどうかを確かめられませんでした。端末で入力欄を見てください。入力欄に文字があるときに Ctrl+S を押すと、その文字が退避され、前に退避したものは消えます。",
+    ]);
+  } finally {
+    engine.abortAll();
+  }
+});
+
 test("an accepted Orca turn ignores a historical completion until its own transcript boundary", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "cctag-orca-stale-end-"));
   const sessionId = "session-stale-end";
@@ -315,7 +380,7 @@ test("an accepted Orca turn ignores a historical completion until its own transc
       },
       async submit() {
         submitted = true;
-        return "accepted";
+        return { status: "accepted", draftStashed: false };
       },
     },
     "orca",
@@ -833,7 +898,7 @@ test("Orca rejects original C0 text before downloading attachments", async () =>
       },
       async submit(_ref, text) {
         submitted.push(text);
-        return "accepted";
+        return { status: "accepted", draftStashed: false };
       },
     },
     "orca",
@@ -892,7 +957,7 @@ test("OMP turns submit normal text and keep their poll loop attached", async () 
       },
       async submit(_ref, text) {
         submitted.push(text);
-        return "accepted";
+        return { status: "accepted", draftStashed: false };
       },
     },
     "orca",
@@ -968,7 +1033,7 @@ test("an accepted OMP turn ignores historical completion until its own transcrip
       },
       async submit() {
         submitted = true;
-        return "accepted";
+        return { status: "accepted", draftStashed: false };
       },
     },
     "orca",
@@ -1072,7 +1137,7 @@ test("adopted OMP waits post one plain screen notice and resolve it at the termi
       },
       async submit() {
         terminalWrites++;
-        return "accepted";
+        return { status: "accepted", draftStashed: false };
       },
     },
     "orca",
@@ -1222,7 +1287,7 @@ test("Orca permits interior LF and TAB and reports an accepted write", async () 
       },
       async submit(_ref, submittedText) {
         submitted.push(submittedText);
-        return "accepted";
+        return { status: "accepted", draftStashed: false };
       },
     },
     "orca",
@@ -1269,7 +1334,7 @@ test("a startup dialog asks for a terminal-side answer instead of submitting", a
       },
       async submit() {
         submits++;
-        return "accepted";
+        return { status: "accepted", draftStashed: false };
       },
     },
     "orca",
@@ -1300,7 +1365,7 @@ test("disconnecting during startTurn's setup abandons it instead of prompting th
   const herdr = fakeBackend(() => "idle", () => "", {
     async submit(_ref, text) {
       prompted.push(text);
-      return "accepted";
+      return { status: "accepted", draftStashed: false };
     },
   });
   const engine = engineFor(herdr, notifier, 600_000);
@@ -1472,7 +1537,7 @@ test("a cancel mid-submit leaves the pane held until the keystrokes stop", async
   const herdr = fakeBackend(() => "working", () => "", {
     async submit() {
       await new Promise<void>((r) => (releasePrompt = r));
-      return "accepted";
+      return { status: "accepted", draftStashed: false };
     },
   });
   const engine = engineFor(herdr, notifier, 600_000);

@@ -186,6 +186,7 @@ class FakeOrcaRuntime implements OrcaRuntime {
   hookStatuses: JsonObject[] = objectRows(capturedHooksResult.statuses);
   showFields: JsonObject = {};
   screen: JsonObject = { ...capturedReadTerminal };
+  screenSequence: JsonObject[] = [];
   terminalListFailure = false;
 
   constructor() {
@@ -385,9 +386,10 @@ class FakeOrcaRuntime implements OrcaRuntime {
     }
     if (args[0] === "terminal" && args[1] === "read") {
       const handle = args[args.indexOf("--terminal") + 1] ?? "";
+      const screen = this.screenSequence.shift() ?? this.screen;
       const result = successResponse(terminalReadCapture, {
         ...responseResult(terminalReadCapture),
-        terminal: { ...this.screen, handle },
+        terminal: { ...screen, handle },
       });
       this.screenReadHook?.();
       return result;
@@ -508,6 +510,12 @@ function capturedClaudeScreen(name: string): JsonObject {
     readFileSync(new URL(`../agents/claude/__fixtures__/${name}`, import.meta.url), "utf8"),
   ) as { terminal: JsonObject };
   return fixture.terminal;
+}
+
+function capturedProbeScreen(name: string): JsonObject {
+  const terminal = object(responseResult(readJsonFixture(`./__fixtures__/orca/${name}`)).terminal);
+  if (!terminal) throw new Error(`probe fixture ${name} has no terminal object`);
+  return terminal;
 }
 
 function capturedOmpScreen(name: string): JsonObject {
@@ -921,8 +929,8 @@ test("same-tty foreground Claude/OMP nesting is rejected in both directions", as
 
 test("OMP submits use one exact verified write and keep all answer channels terminal-only", async () => {
   for (const scenario of [
-    { stages: ["input_accepted", "turn_started"], expected: "started" },
-    { stages: ["input_accepted"], expected: "accepted" },
+    { stages: ["input_accepted", "turn_started"], expected: { status: "started", draftStashed: false } },
+    { stages: ["input_accepted"], expected: { status: "accepted", draftStashed: false } },
   ] as const) {
     const runtime = new FakeOrcaRuntime();
     const process = installOmpProcess(runtime);
@@ -947,7 +955,7 @@ test("OMP submits use one exact verified write and keep all answer channels term
       return execFile(file, args, options);
     };
 
-    assert.equal(
+    assert.deepEqual(
       await terminals.submit(agent.ref, "hello", { ...submitContext(), driver: ompDriver }),
       scenario.expected,
     );
@@ -1031,6 +1039,7 @@ test("OMP working, waiting, draft, and incomplete screens never send input", asy
     { name: "draft", screen: capturedOmpScreen("draft.screen.json"), reason: "not-idle" },
     {
       name: "incomplete",
+      // Synthetic incomplete variant derived from the raw idle.screen.json capture.
       screen: { ...capturedOmpScreen("idle.screen.json"), limited: true },
       reason: "incomplete-screen",
     },
@@ -1184,12 +1193,14 @@ test("screen reads are full-frame and reject non-positive line counts", async ()
   assert.deepEqual(readCall.args.slice(0, 5), ["terminal", "read", "--terminal", HANDLE, "--screen"]);
   assert.equal(readCall.args.includes("--limit"), false, "screen reads must not send a zero or truncating limit");
 
+  // Synthetic completeness variants of the raw terminalReadCapture.
   runtime.screen = { ...runtime.screen, limited: true };
   assert.equal((await terminals.read(TARGET, 40, "history")).complete, false);
   runtime.screen = { ...runtime.screen, limited: false, truncated: true };
   assert.equal((await terminals.read(TARGET, 40, "screen")).complete, false);
   runtime.screen = { ...runtime.screen, source: "screen-unavailable", truncated: false };
   assert.equal((await terminals.read(TARGET, 40, "screen")).complete, false);
+  // Synthetic malformed screen records; these are not raw captured CLI outputs.
   runtime.screen = { source: "screen", status: "running", tail: ["shortened output"] };
   assert.equal((await terminals.read(TARGET, 40, "screen")).complete, false);
   runtime.screen = { source: "screen", status: "running", limited: false, truncated: false, tail: ["valid", 42] };
@@ -1561,6 +1572,7 @@ test("Orca submit refuses all five unsafe outcomes without accepted input", asyn
       reason: "incomplete-screen",
       sendAttempts: 0,
       prepare: (runtime) => {
+        // Synthetic limited-screen variant derived from idle-composer.screen.json.
         runtime.screen = { ...idle(), limited: true };
         return currentRef();
       },
@@ -1577,6 +1589,7 @@ test("Orca submit refuses all five unsafe outcomes without accepted input", asyn
       reason: "draft",
       sendAttempts: 0,
       prepare: (runtime) => {
+        // Synthetic draft overlay derived from idle-composer.screen.json.
         runtime.screen = { ...idle(), draft: "unsent draft" };
         return currentRef();
       },
@@ -1595,8 +1608,11 @@ test("Orca submit refuses all five unsafe outcomes without accepted input", asyn
     const runtime = new FakeOrcaRuntime();
     runtime.screen = idle();
     const ref = testCase.prepare(runtime);
-    await assert.rejects(backend(runtime).submit(ref, "hello", submitContext()), (error: unknown) =>
-      error instanceof SubmitRefused && error.reason === testCase.reason,
+    const context =
+      testCase.reason === "draft" ? { ...submitContext(), driver: ompDriver } : submitContext();
+    await assert.rejects(
+      backend(runtime).submit(ref, "hello", context),
+      (error: unknown) => error instanceof SubmitRefused && error.reason === testCase.reason,
     );
     assert.equal(runtime.sendCalls.length, testCase.sendAttempts, testCase.reason);
     assert.equal(runtime.acceptedInputWrites, 0, testCase.reason);
@@ -1607,17 +1623,17 @@ test("Orca submit separates started and accepted receipts and never resends ambi
   for (const scenario of [
     {
       stages: ["input_accepted", "turn_started"],
-      expected: "started",
+      expected: { status: "started", draftStashed: false },
     },
     {
       stages: ["input_accepted"],
-      expected: "accepted",
+      expected: { status: "accepted", draftStashed: false },
     },
   ] as const) {
     const runtime = new FakeOrcaRuntime();
     runtime.screen = capturedClaudeScreen("idle-composer.screen.json");
     runtime.sendReceipt = withSendStages(capturedSendResult, scenario.stages);
-    assert.equal(await backend(runtime).submit(currentRef(), "hello", submitContext()), scenario.expected);
+    assert.deepEqual(await backend(runtime).submit(currentRef(), "hello", submitContext()), scenario.expected);
     assert.equal(runtime.sendCalls.length, 1);
     assert.equal(runtime.acceptedInputWrites, 1);
     assert.equal(runtime.sendCalls[0]!.timeoutMs, 25_000);
@@ -1646,6 +1662,411 @@ test("Orca submit separates started and accepted receipts and never resends ambi
   );
   assert.equal(runtime.sendCalls.length, 1, "ambiguous submission must not be resent");
   assert.equal(runtime.acceptedInputWrites, 0);
+});
+
+test("Orca probes and removes a suggestion before submitting", async () => {
+  const runtime = new FakeOrcaRuntime();
+  const suggestion = capturedProbeScreen("p4-10-suggestion.json");
+  const withProbe = capturedProbeScreen("p4-11-suggestion-plus-x.json");
+  const restored = capturedProbeScreen("p4-12-suggestion-after-bs.json");
+  runtime.screen = restored;
+  runtime.screenSequence = [
+    suggestion,
+    suggestion,
+    withProbe,
+    withProbe,
+    withProbe,
+    restored,
+    restored,
+    restored,
+  ];
+  runtime.sendReceipt = withSendStages(capturedSendResult, ["input_accepted"]);
+
+  const result = await backend(runtime).submit(currentRef(), "hello", submitContext());
+
+  assert.deepEqual(result, { status: "accepted", draftStashed: false });
+  assert.deepEqual(
+    runtime.sendCalls.map(({ args }) => args.slice(args.indexOf("--text") + 1)),
+    [
+      ["x", "--json"],
+      ["\u007f", "--json"],
+      ["hello", "--enter", "--wait-submit", "15", "--json"],
+    ],
+  );
+});
+
+test("Orca accepts an empty composer after removing a suggestion", async () => {
+  const runtime = new FakeOrcaRuntime();
+  const suggestion = capturedProbeScreen("p4-10-suggestion.json");
+  const withProbe = capturedProbeScreen("p4-11-suggestion-plus-x.json");
+  // Synthetic empty-draft state derived from the raw p4-12-suggestion-after-bs.json capture.
+  const empty = { ...capturedProbeScreen("p4-12-suggestion-after-bs.json"), draft: null };
+  runtime.screen = empty;
+  runtime.screenSequence = [
+    suggestion,
+    suggestion,
+    withProbe,
+    withProbe,
+    withProbe,
+    empty,
+    empty,
+    empty,
+  ];
+  runtime.sendReceipt = withSendStages(capturedSendResult, ["input_accepted"]);
+
+  const result = await backend(runtime).submit(currentRef(), "hello", submitContext());
+
+  assert.deepEqual(result, { status: "accepted", draftStashed: false });
+  assert.equal(runtime.sendCalls.length, 3);
+});
+
+test("Orca requires two consecutive complete positive probe reads", async () => {
+  const runtime = new FakeOrcaRuntime();
+  const suggestion = capturedProbeScreen("p4-10-suggestion.json");
+  const withProbe = capturedProbeScreen("p4-11-suggestion-plus-x.json");
+  // Synthetic unexpected draft value derived from the raw p4-11-suggestion-plus-x.json capture.
+  const fluctuating = { ...withProbe, draft: "unexpected" };
+  // Synthetic incomplete-screen state derived from the raw p4-11-suggestion-plus-x.json capture.
+  const incomplete = { ...withProbe, truncated: true };
+  const restored = capturedProbeScreen("p4-12-suggestion-after-bs.json");
+  runtime.screen = restored;
+  runtime.screenSequence = [
+    suggestion,
+    suggestion,
+    withProbe,
+    fluctuating,
+    incomplete,
+    withProbe,
+    withProbe,
+    withProbe,
+    restored,
+    restored,
+  ];
+  runtime.sendReceipt = withSendStages(capturedSendResult, ["input_accepted"]);
+
+  const result = await backend(runtime).submit(currentRef(), "hello", submitContext());
+
+  assert.deepEqual(result, { status: "accepted", draftStashed: false });
+  assert.equal(runtime.screenSequence.length, 0, "unstable and incomplete reads do not count as confirmations");
+  assert.equal(runtime.sendCalls.length, 3);
+});
+
+test("Orca stashes a typed draft and submits only after Ctrl+S is verified", async () => {
+  const runtime = new FakeOrcaRuntime();
+  const draft = capturedProbeScreen("p4-00-draft.json");
+  const withProbe = capturedProbeScreen("p4-01-draft-plus-x.json");
+  const restored = capturedProbeScreen("p4-02-draft-after-bs.json");
+  const stashed = capturedProbeScreen("p3-10-stashed.json");
+  runtime.screen = stashed;
+  runtime.screenSequence = [
+    draft,
+    draft,
+    withProbe,
+    withProbe,
+    withProbe,
+    restored,
+    restored,
+    restored,
+    stashed,
+    stashed,
+  ];
+  runtime.sendReceipt = withSendStages(capturedSendResult, ["input_accepted"]);
+
+  const order: string[] = [];
+  const execFile = runtime.execFile.bind(runtime);
+  runtime.execFile = async (file, args, options) => {
+    if (file === runtime.bin && args[0] === "terminal" && args[1] === "read") order.push("read");
+    if (file === runtime.bin && args[0] === "terminal" && args[1] === "send") order.push("send");
+    return execFile(file, args, options);
+  };
+  const terminals = backend(runtime);
+  const sameProcess = terminals.sameProcess.bind(terminals);
+  terminals.sameProcess = async (ref) => {
+    const current = await sameProcess(ref);
+    order.push("process");
+    return current;
+  };
+
+  const result = await terminals.submit(currentRef(), "hello", submitContext());
+
+  assert.deepEqual(result, { status: "accepted", draftStashed: true });
+  assert.deepEqual(
+    runtime.sendCalls.map(({ args }) => args.slice(args.indexOf("--text") + 1)),
+    [
+      ["x", "--json"],
+      ["\u007f", "--json"],
+      ["\u0013", "--json"],
+      ["hello", "--enter", "--wait-submit", "15", "--json"],
+    ],
+  );
+  assert.equal(order.filter((event) => event === "send").length, 4);
+  for (let index = 0; index < order.length; index++) {
+    if (order[index] === "send") {
+      assert.deepEqual(order.slice(index - 2, index), ["read", "process"]);
+    }
+  }
+});
+
+test("Orca re-probes a stashed suggestion and refuses a second typed draft", async () => {
+  const draft = capturedProbeScreen("p4-00-draft.json");
+  const withProbe = capturedProbeScreen("p4-01-draft-plus-x.json");
+  const restored = capturedProbeScreen("p4-02-draft-after-bs.json");
+  // Synthetic draft override derived from the raw p4-10-suggestion.json capture.
+  const stashedX = { ...capturedProbeScreen("p4-10-suggestion.json"), draft: "x" };
+  // Synthetic draft override derived from the raw p4-11-suggestion-plus-x.json capture.
+  const withY = { ...capturedProbeScreen("p4-11-suggestion-plus-x.json"), draft: "y" };
+  // Synthetic draft override derived from the raw p4-12-suggestion-after-bs.json capture.
+  const restoredX = { ...capturedProbeScreen("p4-12-suggestion-after-bs.json"), draft: "x" };
+  // Synthetic draft override derived from the raw p4-11-suggestion-plus-x.json capture.
+  const withXY = { ...capturedProbeScreen("p4-11-suggestion-plus-x.json"), draft: "xy" };
+
+  const accepted = new FakeOrcaRuntime();
+  accepted.screen = restoredX;
+  accepted.screenSequence = [
+    draft,
+    draft,
+    withProbe,
+    withProbe,
+    withProbe,
+    restored,
+    restored,
+    restored,
+    stashedX,
+    stashedX,
+    stashedX,
+    withY,
+    withY,
+    withY,
+    restoredX,
+    restoredX,
+  ];
+  accepted.sendReceipt = withSendStages(capturedSendResult, ["input_accepted"]);
+  assert.deepEqual(
+    await backend(accepted).submit(currentRef(), "hello", submitContext()),
+    { status: "accepted", draftStashed: true },
+  );
+  assert.deepEqual(
+    accepted.sendCalls.map(({ args }) => args.slice(args.indexOf("--text") + 1)),
+    [
+      ["x", "--json"],
+      ["\u007f", "--json"],
+      ["\u0013", "--json"],
+      ["y", "--json"],
+      ["\u007f", "--json"],
+      ["hello", "--enter", "--wait-submit", "15", "--json"],
+    ],
+  );
+
+  const refused = new FakeOrcaRuntime();
+  refused.screen = restoredX;
+  refused.screenSequence = [
+    draft,
+    draft,
+    withProbe,
+    withProbe,
+    withProbe,
+    restored,
+    restored,
+    restored,
+    stashedX,
+    stashedX,
+    stashedX,
+    withXY,
+    withXY,
+    withXY,
+    restoredX,
+    restoredX,
+  ];
+  await assert.rejects(
+    backend(refused).submit(currentRef(), "hello", submitContext()),
+    (error: unknown) =>
+      error instanceof SubmitRefused &&
+      error.reason === "stash-unverified" &&
+      error.composer.stash === "stashed" &&
+      error.composer.submitUncertain === false,
+  );
+  assert.deepEqual(
+    refused.sendCalls.map(({ args }) => args.slice(args.indexOf("--text") + 1)),
+    [
+      ["x", "--json"],
+      ["\u007f", "--json"],
+      ["\u0013", "--json"],
+      ["y", "--json"],
+      ["\u007f", "--json"],
+    ],
+  );
+});
+
+test("Orca probes exact x with y and rejects an unchanged stale draft", async () => {
+  const runtime = new FakeOrcaRuntime();
+  // Synthetic draft override derived from the raw p4-10-suggestion.json capture.
+  const exactX = { ...capturedProbeScreen("p4-10-suggestion.json"), draft: "x" };
+  runtime.screen = exactX;
+  runtime.screenSequence = [exactX, exactX];
+
+  await assert.rejects(
+    backend(runtime).submit(currentRef(), "hello", submitContext()),
+    (error: unknown) =>
+      error instanceof SubmitRefused &&
+      error.reason === "probe-unverified" &&
+      error.composer.probe === "y" &&
+      error.composer.stash === "untouched",
+  );
+  assert.deepEqual(
+    runtime.sendCalls.map(({ args }) => args.slice(args.indexOf("--text") + 1)),
+    [["y", "--json"]],
+  );
+});
+
+test("Orca refuses when Backspace or Ctrl+S cannot be verified", async () => {
+  const suggestion = capturedProbeScreen("p4-10-suggestion.json");
+  const suggestionPlus = capturedProbeScreen("p4-11-suggestion-plus-x.json");
+  const draft = capturedProbeScreen("p4-00-draft.json");
+  const withProbe = capturedProbeScreen("p4-01-draft-plus-x.json");
+  const restored = capturedProbeScreen("p4-02-draft-after-bs.json");
+  const cases = [
+    {
+      reason: "probe-unverified" as const,
+      sequence: [suggestion, suggestion, suggestionPlus, suggestionPlus, suggestionPlus],
+      fallback: suggestionPlus,
+      expected: [["x", "--json"], ["\u007f", "--json"]],
+      probe: "x",
+      stash: "untouched",
+    },
+    {
+      reason: "stash-unverified" as const,
+      sequence: [draft, draft, withProbe, withProbe, withProbe, restored, restored, restored],
+      fallback: restored,
+      expected: [["x", "--json"], ["\u007f", "--json"], ["\u0013", "--json"]],
+      probe: null,
+      stash: "uncertain",
+    },
+  ];
+
+  for (const scenario of cases) {
+    const runtime = new FakeOrcaRuntime();
+    runtime.screen = scenario.fallback;
+    runtime.screenSequence = scenario.sequence;
+    await assert.rejects(
+      backend(runtime).submit(currentRef(), "hello", submitContext()),
+      (error: unknown) =>
+        error instanceof SubmitRefused &&
+        error.reason === scenario.reason &&
+        error.composer.probe === scenario.probe &&
+        error.composer.stash === scenario.stash,
+      scenario.reason,
+    );
+    assert.deepEqual(
+      runtime.sendCalls.map(({ args }) => args.slice(args.indexOf("--text") + 1)),
+      scenario.expected,
+    );
+  }
+});
+
+test("Orca marks uncertain probe writes without retrying", async () => {
+  const runtime = new FakeOrcaRuntime();
+  const suggestion = capturedProbeScreen("p4-10-suggestion.json");
+  runtime.screen = suggestion;
+  runtime.screenSequence = [suggestion, suggestion];
+  runtime.sendFailure = failure("runtime_unavailable", "transport failed");
+
+  await assert.rejects(
+    backend(runtime).submit(currentRef(), "hello", submitContext()),
+    (error: unknown) =>
+      error instanceof WriteOutcomeUnknown &&
+      error.composer.probe === "x" &&
+      error.composer.stash === "untouched" &&
+      error.composer.submitUncertain === false,
+  );
+  assert.equal(runtime.sendCalls.length, 1);
+  assert.deepEqual(runtime.sendCalls[0]!.args.slice(runtime.sendCalls[0]!.args.indexOf("--text") + 1), [
+    "x",
+    "--json",
+  ]);
+});
+
+test("Orca marks an uncertain Ctrl+S write before stashing is confirmed", async () => {
+  const runtime = new FakeOrcaRuntime();
+  const draft = capturedProbeScreen("p4-00-draft.json");
+  const withProbe = capturedProbeScreen("p4-01-draft-plus-x.json");
+  const restored = capturedProbeScreen("p4-02-draft-after-bs.json");
+  runtime.screen = restored;
+  runtime.screenSequence = [
+    draft,
+    draft,
+    withProbe,
+    withProbe,
+    withProbe,
+    restored,
+    restored,
+    restored,
+  ];
+  runtime.afterSend = () => {
+    if (runtime.sendCalls.length === 2) {
+      runtime.sendFailure = failure("runtime_unavailable", "Ctrl+S transport failed");
+    }
+  };
+
+  await assert.rejects(
+    backend(runtime).submit(currentRef(), "hello", submitContext()),
+    (error: unknown) =>
+      error instanceof WriteOutcomeUnknown &&
+      error.composer.probe === null &&
+      error.composer.stash === "uncertain" &&
+      error.composer.submitUncertain === false,
+  );
+  assert.deepEqual(
+    runtime.sendCalls.map(({ args }) => args.slice(args.indexOf("--text") + 1)),
+    [["x", "--json"], ["\u007f", "--json"], ["\u0013", "--json"]],
+  );
+});
+
+test("Orca carries verified stash state through final gates and unknown submit outcomes", async () => {
+  for (const finalError of ["agent_prompt_blocked", "runtime_unavailable"] as const) {
+    const runtime = new FakeOrcaRuntime();
+    const draft = capturedProbeScreen("p4-00-draft.json");
+    const withProbe = capturedProbeScreen("p4-01-draft-plus-x.json");
+    const restored = capturedProbeScreen("p4-02-draft-after-bs.json");
+    const stashed = capturedProbeScreen("p3-10-stashed.json");
+    runtime.screen = stashed;
+    runtime.screenSequence = [
+      draft,
+      draft,
+      withProbe,
+      withProbe,
+      withProbe,
+      restored,
+      restored,
+      restored,
+      stashed,
+      stashed,
+    ];
+    runtime.afterSend = () => {
+      if (runtime.sendCalls.length === 3) {
+        runtime.sendFailure = failure(finalError, "final send is blocked or uncertain");
+      }
+    };
+    let caught: unknown;
+    await assert.rejects(
+      backend(runtime).submit(currentRef(), "hello", submitContext()),
+      (error: unknown) => {
+        caught = error;
+        return finalError === "agent_prompt_blocked"
+          ? error instanceof SubmitRefused && error.reason === "gate"
+          : error instanceof WriteOutcomeUnknown;
+      },
+    );
+    assert.equal(runtime.sendCalls.length, 4);
+    if (finalError === "agent_prompt_blocked") {
+      assert.ok(caught instanceof SubmitRefused);
+      assert.equal(caught.composer.stash, "stashed");
+      assert.equal(caught.composer.submitUncertain, false);
+    } else {
+      assert.ok(caught instanceof WriteOutcomeUnknown);
+      assert.equal(caught.composer.stash, "stashed");
+      assert.equal(caught.composer.submitUncertain, true);
+    }
+  }
 });
 test("Orca classifies unconfirmed sends as outcome-unknown without retrying", async () => {
   const acceptedThenTransport = new FakeOrcaRuntime();
@@ -1925,6 +2346,7 @@ test("Orca Claude multi-select sends 1 only after the captured review is verifie
 
 test("Orca Claude multi-select refuses incomplete or mismatched reviews without sending 1", async () => {
   const reviewFailure = "確認画面を確かめられなかったので送信していません。端末で確かめてください";
+  // These synthetic rejection screens all derive from the raw review capture named below.
   const invalidReviews: Array<{ name: string; make(): JsonObject }> = [
     {
       name: "missing Cancel",
@@ -2041,6 +2463,7 @@ test("Orca rechecks the Submit cursor on the fresh write snapshot", async () => 
   runtime.screenReadHook = () => {
     if (reviewRead || !capturedText(runtime.screen).includes("Ready to submit your answers?")) return;
     reviewRead = true;
+    // Synthetic cursor move derived from ask-user-question-multiselect-review.screen.json.
     const screen = capturedClaudeScreen("ask-user-question-multiselect-review.screen.json");
     const tail = [...(screen.tail as string[])];
     const submitAt = tail.indexOf("❯ 1. Submit answers");
@@ -2152,14 +2575,20 @@ test("Orca blind permission sends exactly one y-or-n byte without Enter", async 
 
 test("Orca composer BackTab is one raw write after process, screen, idle, and draft gates", async () => {
   const idle = () => capturedClaudeScreen("idle-composer.screen.json");
-  const runtime = new FakeOrcaRuntime();
-  runtime.screen = idle();
-  const channel = backend(runtime).openComposer(currentRef(), claudeDriver);
-  await channel.backTab();
-  await assert.rejects(channel.backTab(), ExpectationLost);
-  assert.equal(runtime.sendCalls.length, 1);
-  assert.equal(runtime.sendCalls[0]!.args[runtime.sendCalls[0]!.args.indexOf("--text") + 1], "\u001b[Z");
-  assert.equal(runtime.sendCalls[0]!.args.includes("--enter"), false);
+  const eligibleScreens = [
+    { name: "ordinary idle composer", screen: idle() },
+    { name: "fresh probe Try placeholder", screen: capturedProbeScreen("probe-A-fresh.json") },
+  ];
+  for (const { name, screen } of eligibleScreens) {
+    const runtime = new FakeOrcaRuntime();
+    runtime.screen = screen;
+    const channel = backend(runtime).openComposer(currentRef(), claudeDriver);
+    await channel.backTab();
+    await assert.rejects(channel.backTab(), ExpectationLost);
+    assert.equal(runtime.sendCalls.length, 1, name);
+    assert.equal(runtime.sendCalls[0]!.args[runtime.sendCalls[0]!.args.indexOf("--text") + 1], "\u001b[Z", name);
+    assert.equal(runtime.sendCalls[0]!.args.includes("--enter"), false, name);
+  }
 
   const blocked: Array<{ name: string; prepare(runtime: FakeOrcaRuntime): AgentRef }> = [
     {
@@ -2172,6 +2601,7 @@ test("Orca composer BackTab is one raw write after process, screen, idle, and dr
     {
       name: "incomplete screen",
       prepare: (runtime) => {
+        // Synthetic limited-screen variant derived from idle-composer.screen.json.
         runtime.screen = { ...idle(), limited: true };
         return currentRef();
       },
@@ -2186,6 +2616,7 @@ test("Orca composer BackTab is one raw write after process, screen, idle, and dr
     {
       name: "non-empty draft",
       prepare: (runtime) => {
+        // Synthetic draft overlay derived from idle-composer.screen.json.
         runtime.screen = { ...idle(), draft: "unsent draft" };
         return currentRef();
       },
@@ -2223,6 +2654,7 @@ test("Orca multi-select free text verifies its own answer in the review screen",
       runtime.screen = capturedClaudeScreen("ask-user-question-multiselect-submit-row.screen.json");
     }
     if (runtime.sendCalls.length === 4) {
+      // Synthetic answer alteration derived from ask-user-question-multiselect-review.screen.json.
       const review = capturedClaudeScreen("ask-user-question-multiselect-review.screen.json");
       const tail = [...(review.tail as string[])];
       tail[tail.indexOf("   → Amber, Jade")] = "   → Other color";

@@ -23,6 +23,7 @@ import {
   WRITE_OUTCOME_UNKNOWN_MESSAGE,
 } from "./backend/types.js";
 import type { AgentInfo, AgentRef, AgentStatus, BackendName, ScreenSnapshot, TranscriptIdentity } from "./backend/types.js";
+import { draftStashedText, submitRefusedText, writeOutcomeUnknownText } from "./backend/submit-notice.js";
 import { backendForTarget } from "./backend/target.js";
 import { PaneLeaseRegistry, type PaneLease } from "./leases.js";
 import { EMPTY_TRANSCRIPT_BOUNDARIES, resolveStatus, SettleTracker, transcriptBoundaries, type StatusResolution } from "./settle.js";
@@ -523,14 +524,24 @@ export class TurnEngine {
           retryLimit: retries,
           pollIntervalMs: this.opts.pollIntervalMs,
         });
-        if (backend === "orca" && outcome === "accepted") {
+        if (outcome.draftStashed) {
+          await this.notifier
+            .postReply(pairing.channel, pairing.threadTs ?? "", draftStashedText(backend))
+            .catch(() => {});
+        }
+        if (backend === "orca" && outcome.status === "accepted") {
           await statusHandle.update(`📨 ${backend} は入力を受け付けました。ターン開始を確認しています…`).catch(() => {});
         }
       } catch (err) {
         // Input injection failed after the state was already registered —
         // roll it back so the terminal doesn't stay stuck "busy" forever.
-        this.turns.delete(paneId);
-        await statusHandle.update("❌ 開始に失敗しました").catch(() => {});
+        const failureNotice =
+          err instanceof SubmitRefused
+            ? submitRefusedText(err.reason, backend, err.composer)
+            : err instanceof WriteOutcomeUnknown
+              ? writeOutcomeUnknownText(err)
+              : "❌ 開始に失敗しました";
+        await statusHandle.update(failureNotice).catch(() => {});
         throw err;
       }
 

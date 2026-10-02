@@ -3,7 +3,7 @@ import { basename } from "node:path";
 import type { AnswerChannel, Terminals } from "../../backend/index.js";
 import type { AgentInfo } from "../../backend/types.js";
 import { promptFingerprint } from "../fingerprint.js";
-import type { AgentDriver, BlockedPrompt } from "../driver.js";
+import type { AgentDriver, BlockedPrompt, ModelCommandResult } from "../driver.js";
 import {
   createBlindPermissionPrompt,
   createVerifiedModelMenuPrompt,
@@ -151,20 +151,24 @@ export const codexDriver: AgentDriver = {
 
   modes: null, // no Shift+Tab ring, no plan mode
 
-  async runModelCommand(terminals, agent, argsText) {
+  async runModelCommand(terminals, agent, argsText): Promise<ModelCommandResult> {
+    const result = (reply: string, submitOutcome: ModelCommandResult["submitOutcome"] = null) => ({
+      reply,
+      submitOutcome,
+    });
     const words = argsText.trim().split(/\s+/).filter(Boolean);
     if (words.length === 0) {
-      return "⚠️ モデル名を指定してください（例: `model gpt-5.6-sol high`）。";
+      return result("⚠️ モデル名を指定してください（例: `model gpt-5.6-sol high`）。");
     }
     const { levelKey, modelWords } = splitModelAndLevel(words);
     const modelQuery = modelWords.join(" ").toLowerCase();
     if (!modelQuery) {
-      return "⚠️ モデル名を指定してください。";
+      return result("⚠️ モデル名を指定してください。");
     }
 
     // Atomic submit (see TurnEngine.startTurn) — avoids the send-text/Enter
     // paste race that can leave "/model" sitting unsent in the composer.
-    await terminals.submit(agent.ref, "/model", {
+    const submitOutcome = await terminals.submit(agent.ref, "/model", {
       driver: codexDriver,
       cancelled: () => false,
       transcriptGrew: () => false,
@@ -176,11 +180,11 @@ export const codexDriver: AgentDriver = {
     const stage1Text = (await terminals.read(agent.ref.target, 30, "screen")).text;
     const stage1 = parseCodexMenu(stage1Text);
     if (!stage1) {
-      return "⚠️ モデル選択メニューを開けませんでした。";
+      return result("⚠️ モデル選択メニューを開けませんでした。", submitOutcome);
     }
     const firstPrompt = parseCodexModelMenuPrompt(stage1Text);
     if (!firstPrompt) {
-      return "⚠️ モデル選択メニューを開けませんでした。";
+      return result("⚠️ モデル選択メニューを開けませんでした。", submitOutcome);
     }
     const firstChannel = terminals.openModelAnswer(agent.ref, firstPrompt);
 
@@ -188,12 +192,12 @@ export const codexDriver: AgentDriver = {
     if (!match) {
       await firstChannel.escape();
       const candidates = stage1.choices.map((c) => modelNameKey(c.label)).join(", ");
-      return `⚠️ モデル「${modelQuery}」が見つかりません。候補: ${candidates}`;
+      return result(`⚠️ モデル「${modelQuery}」が見つかりません。候補: ${candidates}`, submitOutcome);
     }
     const modelName = modelNameKey(match.label);
 
     if (!(await selectRowViaArrows(firstChannel, stage1Text, match.num, match.label))) {
-      return "⚠️ モデル選択メニューのカーソル位置を判別できませんでした。";
+      return result("⚠️ モデル選択メニューのカーソル位置を判別できませんでした。", submitOutcome);
     }
     await sleep(500);
 
@@ -201,15 +205,15 @@ export const codexDriver: AgentDriver = {
     if (!isEffortListScreen(stage2Text)) {
       // Some models apply immediately with no separate effort screen —
       // the model change (with whatever default effort) is already done.
-      return `✅ モデルを ${modelName} に切り替えました。`;
+      return result(`✅ モデルを ${modelName} に切り替えました。`, submitOutcome);
     }
     const stage2 = parseCodexMenu(stage2Text);
     if (!stage2) {
-      return `✅ モデルを ${modelName} に切り替えました（推論レベル画面を解析できませんでした）。`;
+      return result(`✅ モデルを ${modelName} に切り替えました（推論レベル画面を解析できませんでした）。`, submitOutcome);
     }
     const secondPrompt = parseCodexModelMenuPrompt(stage2Text);
     if (!secondPrompt) {
-      return `✅ モデルを ${modelName} に切り替えました（推論レベル画面を解析できませんでした）。`;
+      return result(`✅ モデルを ${modelName} に切り替えました（推論レベル画面を解析できませんでした）。`, submitOutcome);
     }
     const secondChannel = terminals.openModelAnswer(agent.ref, secondPrompt);
 
@@ -221,22 +225,28 @@ export const codexDriver: AgentDriver = {
         complete: true,
       });
       if (selectedLabel === null) {
-        return `⚠️ モデルを ${modelName} に切り替えましたが、推論レベル画面のカーソル位置を判別できませんでした。`;
+        return result(
+          `⚠️ モデルを ${modelName} に切り替えましたが、推論レベル画面のカーソル位置を判別できませんでした。`,
+          submitOutcome,
+        );
       }
       await secondChannel.confirm(selectedLabel);
-      return `✅ モデルを ${modelName} に切り替えました。`;
+      return result(`✅ モデルを ${modelName} に切り替えました。`, submitOutcome);
     }
 
     const levelMatch = stage2.choices.find((c) => effortLevelKey(c.label) === levelKey);
     if (!levelMatch) {
       await secondChannel.escape();
       const candidates = stage2.choices.map((c) => effortLevelKey(c.label)).join(", ");
-      return `⚠️ ${modelName} には「${levelKey}」レベルがありません。候補: ${candidates}`;
+      return result(`⚠️ ${modelName} には「${levelKey}」レベルがありません。候補: ${candidates}`, submitOutcome);
     }
     if (!(await selectRowViaArrows(secondChannel, stage2Text, levelMatch.num, levelMatch.label))) {
-      return `⚠️ モデルを ${modelName} に切り替えましたが、推論レベル画面のカーソル位置を判別できませんでした。`;
+      return result(
+        `⚠️ モデルを ${modelName} に切り替えましたが、推論レベル画面のカーソル位置を判別できませんでした。`,
+        submitOutcome,
+      );
     }
-    return `✅ モデルを ${modelName} (${effortLevelKey(levelMatch.label)}) に切り替えました。`;
+    return result(`✅ モデルを ${modelName} (${effortLevelKey(levelMatch.label)}) に切り替えました。`, submitOutcome);
   },
 };
 
