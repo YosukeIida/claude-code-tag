@@ -154,6 +154,8 @@ const TERMINAL_STOP_REASONS = new Set(["end_turn", "stop_sequence", "max_tokens"
 
 const INTERRUPTED_USER_PREFIX = "[Request interrupted by user";
 
+const LOCAL_COMMAND_STDOUT_PREFIX = "<local-command-stdout>";
+
 function parseBoundaryTimestamp(timestamp: string | undefined): number | null {
   if (timestamp === undefined) return null;
   const timestampMs = Date.parse(timestamp);
@@ -192,6 +194,15 @@ function isInterruptedUserContent(content: unknown): boolean {
  * in the turn. Claude's single-text-block interrupt marker is instead an
  * `aborted` boundary.
  *
+ * A local command (`/compact`, `/model`, `/effort`, `/copy`) writes only
+ * string `user` records — a compaction summary, a `<local-command-caveat>`,
+ * the `<command-name>` record — and ends on one whose content starts with
+ * `<local-command-stdout>`, with neither an `end_turn` nor a `turn_duration`
+ * after it (measured on Claude Code 2.1.x across 40 transcripts). That record
+ * is the `completed` boundary; without it the turn would read as started
+ * forever. A prompt-type slash command (a skill) writes no stdout record and
+ * still ends on the assistant's reply.
+ *
  * Sidechain records (subagent transcripts) are skipped: their turns are not the
  * pane's turn, and letting them arm or settle the tracker would report a
  * subagent's completion as the pane's.
@@ -215,7 +226,7 @@ export function extractLifecycle(records: TranscriptRecord[]): TurnLifecycleEven
       const content = r.message?.content;
       if (typeof content === "string") {
         events.push({
-          kind: "started",
+          kind: content.startsWith(LOCAL_COMMAND_STDOUT_PREFIX) ? "completed" : "started",
           timestamp: parseBoundaryTimestamp(r.timestamp),
         });
       } else if (Array.isArray(content)) {

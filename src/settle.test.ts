@@ -332,6 +332,39 @@ test("an unknown end timestamp cannot release a waiting hint", async () => {
   assert.equal(resolved.extendDeadline, true);
 });
 
+test("a local command ends its turn on Orca and leaves herdr's status alone", async () => {
+  // /compact writes only string user records and ends on its stdout record.
+  const lifecycle = extractLifecycle(
+    readFileSync(new URL("./agents/claude/__fixtures__/claude-compact.jsonl", import.meta.url), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as TranscriptRecord),
+  );
+  const settle = new SettleTracker();
+  settle.observe(lifecycle);
+  assert.equal(settle.settledByTranscript, true);
+
+  // A stale "working" hint must not outlive the transcript's end.
+  const resolved = await resolveStatus({
+    evidence: hint("working", null),
+    settle,
+    boundaries: transcriptBoundaries(lifecycle),
+    previousStatus: "working",
+    readScreen: async () => assert.fail("a settled turn needs no screen"),
+  });
+  assert.deepEqual(resolved, { status: "idle", extendDeadline: false });
+
+  for (const status of ["idle", "blocked"] as const) {
+    const herdr = await resolveStatus({
+      evidence: { kind: "classified", status },
+      settle,
+      boundaries: EMPTY_TRANSCRIPT_BOUNDARIES,
+      previousStatus: "working",
+    });
+    assert.equal(herdr.status, status);
+  }
+});
+
 test("without transcript boundaries, the Orca state hint is the fallback", async () => {
   for (const [state, expected] of [
     ["working", "working"],
