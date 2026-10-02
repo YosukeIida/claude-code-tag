@@ -31,6 +31,15 @@ would have to keep. Pin an exact version if that matters to you.
 
 ### Fixed
 
+- On Orca, a Slack message is no longer refused because Claude Code shows a
+  next-prompt suggestion in the composer: Orca reports the suggestion like typed
+  text, so cctag now tells the two apart with one reversible character. A
+  suggestion is replaced by the message; a typed draft is stashed with Ctrl+S,
+  the message is sent, and Claude Code restores the draft (an earlier stash is
+  overwritten). A new session's empty `Try "…"` composer is now accepted as
+  empty, so sending to it is no longer refused. When cctag cannot confirm the
+  composer's state it sends nothing and says what may be left there. Verified
+  with Claude Code 2.1.287.
 - A question or permission button now answers only the prompt it was posted for,
   and only from the thread the pane is paired to. Prompt IDs restarted at 1 on
   every turn, so a button left over from an earlier turn could match a newer

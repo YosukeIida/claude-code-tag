@@ -146,6 +146,16 @@ a verifiable open transcript cannot be connected; if that leaves no
 connectable agents, the empty `@cctag connect` result says to start a new
 session.
 
+Orca reports Claude Code's grayed-out next-prompt suggestion the same way as
+text a person typed, so before sending a Slack message into a non-empty
+composer cctag types one character to tell them apart and removes it again. A
+suggestion is replaced by the message. A typed draft is stashed with Ctrl+S,
+the message is sent, and Claude Code puts the draft back; this replaces any
+draft stashed earlier, because Claude Code keeps only one. When cctag cannot
+confirm what happened, it sends nothing and says in the thread what may be left
+in the composer. This was verified with Claude Code 2.1.287; on other versions
+a message may be refused while a suggestion is shown.
+
 For a fuller walkthrough of the mechanism — Hub/Spoke roles, how herdr's
 agent registry differs from raw pane access, why a turn ending is decided
 from the transcript, the AskUserQuestion detection quirk, how attachments are
