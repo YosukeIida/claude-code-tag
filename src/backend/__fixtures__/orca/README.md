@@ -24,3 +24,8 @@ Captured on 2026-10-02 with Claude Code 2.1.287 and Orca CLI/app 1.4.216. Each f
 - `p3-11-right-after-submit.json` — observed post-submit draft restoration (`capture/V9/p3-11-right-after-submit.json`).
 - `probe-A-fresh.json` — fresh-session composer with the `❯ Try "…"` placeholder (`capture/V9/probe-A-fresh.json`).
 - `probe-C-typed.json` — typed draft reported separately from the visible `❯` row (`capture/V9/probe-C-typed.json`).
+
+Two screen reads from long-lived terminals, captured on 2026-10-02 with Orca 1.4.216, keep the raw envelope and every flag; every non-blank screen row is replaced by `<screen row>` (the rows are other sessions' content), and request IDs, terminal handles and runtime IDs are redacted.
+
+- `screen-read-long-lived-truncated.json` — a Claude Code terminal: `truncated: true` (carried over from Orca's stream buffer), `limited: false`, 52 rows; the screen itself is whole.
+- `screen-read-omp-limited-truncated.json` — an `omp` terminal: `truncated: true`, `limited: true`, 68 rows.

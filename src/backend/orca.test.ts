@@ -1196,9 +1196,13 @@ test("screen reads are full-frame and reject non-positive line counts", async ()
   // Synthetic completeness variants of the raw terminalReadCapture.
   runtime.screen = { ...runtime.screen, limited: true };
   assert.equal((await terminals.read(TARGET, 40, "history")).complete, false);
-  runtime.screen = { ...runtime.screen, limited: false, truncated: true };
+  // Raw reads from long-lived terminals (rows masked): a stream-buffer `truncated`
+  // alone does not make a screen incomplete; `limited` still does.
+  runtime.screen = capturedProbeScreen("screen-read-long-lived-truncated.json");
+  assert.equal((await terminals.read(TARGET, 40, "screen")).complete, true);
+  runtime.screen = capturedProbeScreen("screen-read-omp-limited-truncated.json");
   assert.equal((await terminals.read(TARGET, 40, "screen")).complete, false);
-  runtime.screen = { ...runtime.screen, source: "screen-unavailable", truncated: false };
+  runtime.screen = { ...capturedProbeScreen("screen-read-long-lived-truncated.json"), source: "screen-unavailable" };
   assert.equal((await terminals.read(TARGET, 40, "screen")).complete, false);
   // Synthetic malformed screen records; these are not raw captured CLI outputs.
   runtime.screen = { source: "screen", status: "running", tail: ["shortened output"] };

@@ -758,8 +758,12 @@ export class OrcaBackend implements Terminals {
         validTail &&
         terminal.source === "screen" &&
         terminal.status === "running" &&
-        terminal.limited === false &&
-        terminal.truncated === false,
+        // `truncated` is deliberately not read: on a screen read it is carried
+        // over from Orca's stream buffer, which sets it once any output was ever
+        // trimmed and never clears it, so a long-lived terminal reports it on
+        // every read while the screen itself is whole. `limited === false` does
+        // cover the screen (rows over the limit or characters over 32 KB).
+        terminal.limited === false,
     };
   }
 
